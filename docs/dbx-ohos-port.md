@@ -479,3 +479,60 @@ cp -r dist/* ~/dbx-ohos/static/
 cp -r plugins/dialects ~/dbx-ohos/data/plugins/
 sh ~/dbx-ohos/start.sh
 ```
+
+---
+
+## 10. v0.6.61 更新(2026-10-29)
+
+> 上游跳版:v0.5.88 → v0.6.61(3962 个提交);Rust 1.97.1 → 1.98.1,Node 26.5.0 → 26.10.0。
+
+### 10.1 与 v0.5.88 方案的差异
+
+| 项 | v0.5.88 | v0.6.61 |
+|---|---|---|
+| lightningcss | 装 linux-arm64-musl 包 + 移除 PT_TLS + 重签名 | **改为 JS fallback 包** `packages/lightningcss-openharmony-arm64`(PT_TLS 方案在 1.33 上会破坏 V8 的线程状态) |
+| aws-lc CMake 补丁 | 2 处 `AND UNIX` 门控 | **3 处**(新增 ML-DSA,写法为 `if(UNIX AND ...)`) |
+| 前端依赖 | lightningcss / oxide 伪装 openharmony 平台包 | oxide 仍需符号链接;lightningcss 不再需要原生包 |
+| 后端链接 | 直接 `cc` | 必须把 **OHOS SDK 的 `native/llvm/lib` 前置**到 `LD_LIBRARY_PATH`(SDK 的 lld 依赖自带 libxml2,harmonybrew 的 2.15.4 不兼容) |
+| crates 下载 | 直连 crates.io | 大文件会卡住;改用 USTC 镜像补齐缓存后 `--offline` 构建 |
+| 产物 | 67.8MB | 113.9MB |
+| 构建耗时 | 32m54s | 40m57s(全量)/ 34m(仅方言变更) |
+
+### 10.2 新构建命令
+
+```sh
+# 0) 前置:rustc host = aarch64-unknown-linux-ohos,Node/pnpm 可用
+export OHOS_LLVM=/storage/Users/currentUser/.harmonybrew/Cellar/ohos-sdk/26.0.0.18_2/native/llvm
+export LD_LIBRARY_PATH=$OHOS_LLVM/lib:$LD_LIBRARY_PATH
+
+# 1) 依赖补丁:patches/ohos/*.patch(aws-lc-sys、zstd-sys)
+#    修改 aws-lc 后必须清缓存:
+rm -rf target/release/build/aws-lc-sys-* target/release/deps/libaws_lc_sys-*
+
+# 2) 后端
+cargo build --offline --release -p dbx-web \
+  --config 'profile.release.lto=false' \
+  --config 'profile.release.codegen-units=16'
+
+# 3) 前端(见 10.3)
+pnpm build
+
+# 4) 部署:scripts/ohos-build.sh deploy
+```
+
+### 10.3 前端必要补丁(每次 `pnpm install` 后)
+
+1. 所有 `node_modules/**/*.node` 用 `binary-sign-tool sign -selfSign 1` 重新签名(Darwin 产物跳过);
+2. `@tailwindcss/oxide-openharmony-arm64` → `oxide-linux-arm64-musl@4.3.3` 符号链接;
+3. `lightningcss` 由 workspace 包 `packages/lightningcss-openharmony-arm64` 提供,不需要原生包,也不需要处理 PT_TLS。
+
+以上步骤已封装进 `scripts/ohos-build.sh frontend`。
+
+### 10.4 已知限制(v0.6.61)
+
+1. **方言**:`plugins/dialects/transwarp.yaml` 仍无法加载。除缺 `max_length` 外,`DialectKind` 没有 Hive 家族,`from_label("Transwarp")` 返回 `None`。当前 36/37 方言,Transwarp Inceptor 仅保留连接/JDBC 能力。
+2. **CSS 优化**:lightningcss 在 OHOS 上以直通实现替代,`optimize` 不生效;最终 CSS 仍由 esbuild 压缩。
+3. **构建不可 CI 化**:标准 rustc 没有 `aarch64-unknown-linux-ohos` target,必须在设备(或 OHOS 版 rustc)上原生构建。
+4. **`node_modules` 补丁易失**:重新 `pnpm install` 后需重做 10.3(已脚本化)。
+5. **依赖补丁在 registry 源码内**:见 `patches/ohos/`,由 `scripts/ohos-build.sh patches` 幂等应用。
+6. **远程数据库未回归**:本次仅冒烟 SQLite;MySQL / PostgreSQL / MongoDB 等需真实服务验证。
