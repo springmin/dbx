@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,6 +10,10 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
 const OUT_CN = "releases-cn.json";
 const OUT_EN = "releases-en.json";
+const OUT_INDEX_CN = "index-cn.json";
+const OUT_INDEX_EN = "index-en.json";
+const RELEASES_CN_DIR = "releases-cn";
+const RELEASES_EN_DIR = "releases-en";
 const LATEST_EN_OUT = "latest-en.json";
 const LATEST_NOTES_OUT = "latest-notes.json";
 const EN_CACHE_URL = process.env.CHANGELOG_EN_CACHE_URL || "https://dl.dbxio.com/changelog/releases-en.json";
@@ -55,19 +59,22 @@ export function stripDownloadSection(body) {
 // 剥离 release notes 里的 issue 引用 (closes #xxx)，保留贡献者署名 (contributed by @xxx)。
 // 同时处理纯 closes 括号和混在 contributed by 括号里的 closes 片段。
 function stripIssueRefs(text) {
-  return text
-    // 纯 closes 括号整体去掉，如 (closes #123) 或 (closes #123, closes #456)
-    .replace(/\s*\(closes #\d+(?:,\s*closes #\d+)*\)/g, "")
-    // closes 在前、contributed by 在后，如 (closes #88, contributed by @xxx) → (contributed by @xxx)
-    .replace(/\(closes #\d+,\s*/g, "(")
-    // contributed by 在前、closes 在后，如 (contributed by @xxx, closes #123) → (contributed by @xxx)
-    .replace(/,\s*closes #\d+/g, "");
+  return (
+    text
+      // 纯 closes 括号整体去掉，如 (closes #123) 或 (closes #123, closes #456)
+      .replace(/\s*\(closes #\d+(?:,\s*closes #\d+)*\)/g, "")
+      // closes 在前、contributed by 在后，如 (closes #88, contributed by @xxx) → (contributed by @xxx)
+      .replace(/\(closes #\d+,\s*/g, "(")
+      // contributed by 在前、closes 在后，如 (contributed by @xxx, closes #123) → (contributed by @xxx)
+      .replace(/,\s*closes #\d+/g, "")
+  );
 }
 
 // 对整份 releases JSON 统一剥离 closes # 引用。cache 复用的英文翻译来自 R2，
 // 可能是旧版脚本生成的（desc 仍含 closes #），在写文件前统一清理一次。
 function stripIssueRefsInReleases(json) {
   for (const release of json.releases || []) {
+    if (release.markdown) release.markdown = stripIssueRefs(release.markdown);
     for (const section of release.sections || []) {
       for (const item of section.items || []) {
         if (item.desc) item.desc = stripIssueRefs(item.desc);
@@ -138,12 +145,30 @@ export function buildReleasesJson(releases, now = new Date()) {
         name: r.name || r.tag_name,
         date: r.published_at.slice(0, 10),
         _sourceHash: buildReleaseSourceHash(r),
+        markdown: stripIssueRefs(stripDownloadSection(r.body || "")),
         sections: parseBody(r.body || ""),
       })),
   };
 }
 
+export function buildChangelogIndex(json) {
+  return {
+    updatedAt: json.updatedAt,
+    releases: json.releases.map(({ tag, name, date }) => ({ tag, name, date })),
+  };
+}
+
+function writeReleaseFiles(json, directory) {
+  rmSync(directory, { recursive: true, force: true });
+  mkdirSync(directory, { recursive: true });
+  for (const release of json.releases) {
+    writeFileSync(resolve(directory, `${release.tag}.json`), JSON.stringify(release, null, 2));
+  }
+}
+
 function releaseToMarkdown(release) {
+  if (release.markdown !== undefined) return release.markdown;
+
   return release.sections
     .map((s) => {
       const items = s.items.map((i) => (i.desc ? `- **${i.title}** — ${i.desc}` : `- ${i.title}`)).join("\n");
@@ -164,9 +189,7 @@ function buildLatestEnNotes(enReleasesJson) {
 }
 
 export function buildLatestReleaseNotes(releases) {
-  const latest = releases
-    .filter(isAppRelease)
-    .sort((a, b) => new Date(b.published_at) - new Date(a.published_at))[0];
+  const latest = releases.filter(isAppRelease).sort((a, b) => new Date(b.published_at) - new Date(a.published_at))[0];
   if (!latest) return null;
   return { version: latest.tag_name, notes: latest.body || "" };
 }
@@ -199,7 +222,7 @@ export async function translateToEnglish(cnJson, { cachedEnJson = null, deepseek
     for (const release of cnJson.releases) {
       const cachedRelease = cachedByTag.get(release.tag);
       if (cachedRelease?._sourceHash === release._sourceHash) {
-        enReleases.push({ ...cachedRelease, name: release.name, date: release.date, _sourceHash: release._sourceHash });
+        enReleases.push({ ...cachedRelease, name: release.name, date: release.date, _sourceHash: release._sourceHash, markdown: cachedRelease.markdown || releaseToMarkdown(cachedRelease) });
         reusedCount++;
       } else {
         enReleases.push(release);
@@ -218,6 +241,7 @@ export async function translateToEnglish(cnJson, { cachedEnJson = null, deepseek
         name: release.name,
         date: release.date,
         _sourceHash: release._sourceHash,
+        markdown: cachedRelease.markdown || releaseToMarkdown(cachedRelease),
       });
       reusedCount++;
       continue;
@@ -226,7 +250,7 @@ export async function translateToEnglish(cnJson, { cachedEnJson = null, deepseek
     const sectionsText = releaseToMarkdown(release);
 
     if (!sectionsText.trim()) {
-      enReleases.push({ ...release, sections: [] });
+      enReleases.push({ ...release, sections: [], markdown: "" });
       continue;
     }
 
@@ -256,7 +280,7 @@ export async function translateToEnglish(cnJson, { cachedEnJson = null, deepseek
     const data = await res.json();
     const translated = data.choices?.[0]?.message?.content || "";
     const enSections = parseBody(translated);
-    enReleases.push({ ...release, sections: enSections.length > 0 ? enSections : release.sections });
+    enReleases.push({ ...release, sections: enSections.length > 0 ? enSections : release.sections, markdown: enSections.length > 0 ? translated.trim() : release.markdown });
     translatedCount++;
 
     await sleep(200);
@@ -276,6 +300,9 @@ async function main() {
 
   writeFileSync(OUT_CN, JSON.stringify(cnJson, null, 2));
   console.log(`Wrote ${OUT_CN}`);
+  writeFileSync(OUT_INDEX_CN, JSON.stringify(buildChangelogIndex(cnJson), null, 2));
+  writeReleaseFiles(cnJson, RELEASES_CN_DIR);
+  console.log(`Wrote ${OUT_INDEX_CN} and ${RELEASES_CN_DIR}/`);
 
   const latestNotes = buildLatestReleaseNotes(releases);
   if (latestNotes) {
@@ -293,6 +320,9 @@ async function main() {
     stripIssueRefsInReleases(enJson);
     writeFileSync(OUT_EN, JSON.stringify(enJson, null, 2));
     console.log(`Wrote ${OUT_EN}`);
+    writeFileSync(OUT_INDEX_EN, JSON.stringify(buildChangelogIndex(enJson), null, 2));
+    writeReleaseFiles(enJson, RELEASES_EN_DIR);
+    console.log(`Wrote ${OUT_INDEX_EN} and ${RELEASES_EN_DIR}/`);
 
     // 应用内更新提示用的英文 notes（单条最新版本）
     const latestEn = buildLatestEnNotes(enJson);

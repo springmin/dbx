@@ -11,18 +11,23 @@ const mocks = vi.hoisted(() => ({
     driver_label: "PostgreSQL",
   },
   ensureConnected: vi.fn(),
+  executeQuery: vi.fn(),
   listDataTypes: vi.fn(),
   buildTableStructureChangeSql: vi.fn(),
+  buildMysqlAutoIncrementSql: vi.fn(),
   updateEditorSettings: vi.fn(),
   loadObjectDdl: vi.fn(),
   invalidateObjectDdl: vi.fn(),
   loadObjectMetadataFacet: vi.fn(),
+  invalidateObjectMetadataCache: vi.fn(),
   invalidateTableMetadataCache: vi.fn(),
   getTablePartitionStatus: vi.fn(),
+  getTableOwner: vi.fn(),
+  buildTableOwnerChangeSql: vi.fn(),
   toast: vi.fn(),
 }));
 
-vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
+vi.mock("vue-i18n", async (original) => ({ ...(await original<typeof import("vue-i18n")>()), useI18n: () => ({ t: (key: string) => key }) }));
 
 vi.mock("@lucide/vue", async () => {
   const { defineComponent, h } = await import("vue");
@@ -32,20 +37,24 @@ vi.mock("@lucide/vue", async () => {
     Check: Icon,
     ChevronDown: Icon,
     ChevronUp: Icon,
+    ClipboardList: Icon,
     Copy: Icon,
     Database: Icon,
     Info: Icon,
+    Keyboard: Icon,
     KeyRound: Icon,
     ListChevronsUpDown: Icon,
     Loader2: Icon,
     Maximize2: Icon,
     Plus: Icon,
     RefreshCw: Icon,
+    Rows3: Icon,
     Save: Icon,
     Search: Icon,
     Settings: Icon,
     SlidersHorizontal: Icon,
     Trash2: Icon,
+    UserRound: Icon,
     X: Icon,
   };
 });
@@ -212,6 +221,8 @@ vi.mock("@/components/ui/select", async () => {
 vi.mock("@/stores/connectionStore", () => ({
   useConnectionStore: () => ({
     ensureConnected: mocks.ensureConnected,
+    connectionStateRevision: () => 0,
+    isCurrentConnectionStateRevision: () => true,
     getConfig: (connectionId: string) => (connectionId === mocks.connection.id ? mocks.connection : undefined),
   }),
 }));
@@ -220,7 +231,7 @@ vi.mock("@/stores/queryStore", () => ({ useQueryStore: () => ({ tableStructureRe
 vi.mock("@/stores/historyStore", () => ({ useHistoryStore: () => ({ add: vi.fn() }) }));
 vi.mock("@/stores/settingsStore", () => ({
   useSettingsStore: () => ({
-    editorSettings: { structureEditorDensity: "compact", sqlFormatter: {}, tableColumnTemplateFields: [] },
+    editorSettings: { structureEditorDensity: "compact", sqlFormatter: {}, tableColumnTemplateFields: [], generateSqlQuoteIdentifiers: true },
     updateEditorSettings: mocks.updateEditorSettings,
   }),
 }));
@@ -231,12 +242,16 @@ vi.mock("@/lib/metadata/objectDdlCache", () => ({
   loadObjectDdl: mocks.loadObjectDdl,
   invalidateObjectDdl: mocks.invalidateObjectDdl,
 }));
-vi.mock("@/lib/metadata/objectMetadataCache", () => ({ loadObjectMetadataFacet: mocks.loadObjectMetadataFacet }));
+vi.mock("@/lib/metadata/objectMetadataCache", () => ({ loadObjectMetadataFacet: mocks.loadObjectMetadataFacet, invalidateObjectMetadataCache: mocks.invalidateObjectMetadataCache }));
 vi.mock("@/lib/metadata/tableMetadataCache", () => ({ invalidateTableMetadataCache: mocks.invalidateTableMetadataCache }));
 vi.mock("@/lib/backend/api", () => ({
+  executeQuery: mocks.executeQuery,
   listDataTypes: mocks.listDataTypes,
   buildTableStructureChangeSql: mocks.buildTableStructureChangeSql,
+  buildMysqlAutoIncrementSql: mocks.buildMysqlAutoIncrementSql,
+  buildTableOwnerChangeSql: mocks.buildTableOwnerChangeSql,
   getTablePartitionStatus: mocks.getTablePartitionStatus,
+  getTableOwner: mocks.getTableOwner,
 }));
 
 import TableStructureEditor from "@/components/structure/TableStructureEditor.vue";
@@ -248,11 +263,12 @@ async function mountIndexesEditor() {
   mocks.connection.name = "postgres";
   mocks.connection.driver_label = "postgres";
   mocks.ensureConnected.mockResolvedValue(undefined);
+  mocks.executeQuery.mockResolvedValue({ columns: ["user", "host", "plugin"], rows: [["app_user", "LOGIN", ""]] });
   mocks.listDataTypes.mockResolvedValue([]);
-  mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: false, isPartition: false });
+  mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: false, isPartition: false, isForeign: false });
   mocks.loadObjectDdl.mockResolvedValue({ ddl: "CREATE TABLE users (id bigint)", cacheStatus: "remote" });
   mocks.loadObjectMetadataFacet.mockImplementation(async (_request, facet: string) => ({
-    value: facet === "comment" ? "" : [],
+    value: facet === "comment" ? "" : facet === "owner" ? "app_user" : [],
     cacheStatus: "remote",
   }));
   // The SQL builder mirrors the Concurrent checkbox onto the generated
@@ -297,7 +313,9 @@ function concurrentCheckboxInRow(row: HTMLElement): HTMLInputElement {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: false, isPartition: false });
+  mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: false, isPartition: false, isForeign: false });
+  mocks.getTableOwner.mockResolvedValue("app_user");
+  mocks.buildTableOwnerChangeSql.mockResolvedValue({ statements: [], warnings: [] });
 });
 
 afterEach(() => {
@@ -360,7 +378,7 @@ describe("TableStructureEditor concurrent availability transition", () => {
 
     // Recovery: a later successful probe must lift the blocker and regenerate
     // the preview with the original Concurrent intent, never a blocking CREATE.
-    mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: false, isPartition: false });
+    mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: false, isPartition: false, isForeign: false });
     buttonWithText(root, "structureEditor.refresh").click();
     await vi.waitFor(() => expect(mocks.getTablePartitionStatus).toHaveBeenCalledTimes(3), { timeout: 3000 });
     await vi.waitFor(() => expect(mocks.buildTableStructureChangeSql.mock.calls.length).toBeGreaterThan(callsAtEnabledPhase), { timeout: 3000 });

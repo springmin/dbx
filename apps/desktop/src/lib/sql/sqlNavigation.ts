@@ -2,7 +2,7 @@
  * Utilities for SQL identifier navigation (Ctrl/Cmd + click on table/column names).
  */
 
-import type { ObjectSourceKind } from "@/types/database";
+import type { ObjectSourceKind, QueryTab } from "@/types/database";
 
 const SQL_KEYWORDS_SET = new Set([
   "select",
@@ -135,7 +135,7 @@ export interface ExtractedSqlIdentifierPart {
   quoted: boolean;
 }
 
-export type SqlObjectNavigationType = "table" | "view" | "materialized_view" | "procedure" | "function" | "package" | "trigger";
+export type SqlObjectNavigationType = "table" | "view" | "materialized_view" | "procedure" | "function" | "package" | "package_body" | "sequence" | "synonym" | "trigger" | "index";
 
 /**
  * Semantic role of a Ctrl/Cmd+clicked identifier for navigation.
@@ -161,6 +161,20 @@ export interface SqlObjectNavigationTarget {
   schemaQuoted?: boolean;
   parentNameQuoted?: boolean;
   parentSchemaQuoted?: boolean;
+}
+
+export type SqlObjectNavigationContext = Pick<QueryTab, "connectionId" | "database" | "schema" | "catalog" | "tableMeta">;
+
+/** Resolve a structured object against its captured origin, without reparsing quoted dots. */
+export function sqlObjectNavigationContextTarget(table: SqlObjectNavigationTarget, context: SqlObjectNavigationContext) {
+  return {
+    connectionId: context.connectionId,
+    database: table.database || context.database,
+    catalog: context.tableMeta?.catalog || context.catalog,
+    schema: table.schema || context.schema,
+    tableName: table.name,
+    tableType: table.type ? sqlObjectNavigationTableType(table) : undefined,
+  };
 }
 
 /**
@@ -208,11 +222,11 @@ export function sqlObjectNavigationTarget(table: SqlObjectNavigationTarget): Sql
 }
 
 export function isSqlObjectNavigationRoutineType(type?: SqlObjectNavigationType): boolean {
-  return type === "procedure" || type === "function" || type === "package" || type === "trigger";
+  return type === "procedure" || type === "function" || type === "package" || type === "package_body" || type === "sequence" || type === "synonym" || type === "trigger";
 }
 
 export function sqlObjectHoverDetail(table: SqlObjectNavigationTarget): string {
-  const objectType = table.type === "materialized_view" ? "materialized view" : table.type === "view" ? "view" : table.type === "procedure" ? "procedure" : table.type === "function" ? "function" : table.type === "package" ? "package" : table.type === "trigger" ? "trigger" : "table";
+  const objectType = table.type === "materialized_view" ? "materialized view" : table.type === "package_body" ? "package body" : (table.type ?? "table");
   if (table.parentName) {
     const owner = table.parentSchema ? `${table.parentSchema}.${table.parentName}` : table.parentName;
     return `${objectType} in ${owner}`;
@@ -246,6 +260,12 @@ export function sqlObjectNavigationSourceKind(table: SqlObjectNavigationTarget):
       return "FUNCTION";
     case "package":
       return "PACKAGE";
+    case "package_body":
+      return "PACKAGE_BODY";
+    case "sequence":
+      return "SEQUENCE";
+    case "synonym":
+      return "SYNONYM";
     case "trigger":
       return "TRIGGER";
     default:
@@ -306,8 +326,32 @@ export function mergeSqlObjectNavigationType(left?: SqlObjectNavigationType, rig
   return left ?? right;
 }
 
+// Aligned with the semantic tokenizer (tokens.ts WORD_START/WORD_PART) so Ctrl/Cmd+click,
+// hover range extraction and Unicode identifiers (e.g. CJK names) agree on identifier chars.
+const IDENTIFIER_START_CHAR = /^[A-Za-z_@$#\p{ID_Start}]$/u;
+const IDENTIFIER_PART_CHAR = /^[A-Za-z0-9_@$#\p{ID_Continue}]$/u;
+
+function isIdentifierStartChar(char: string | undefined): boolean {
+  return !!char && IDENTIFIER_START_CHAR.test(char);
+}
+
+/**
+ * MySQL/MariaDB allow an unquoted identifier to begin with a digit as long as it is not a pure
+ * number, so `01_tablename` is a table name while `123` / `1e3` / `0x1f` stay numeric literals
+ * (#9992). Other dialects reject the statement at parse time, so accepting the token here cannot
+ * resolve an identifier the server would refuse to run.
+ */
+function isNumberShapedToken(value: string): boolean {
+  if (!/^[0-9]/.test(value)) return false;
+  const rest = value.slice(1).toLowerCase();
+  if (rest === "") return true;
+  if (rest.startsWith("x")) return /^x[0-9a-f]+$/.test(rest);
+  if (rest.startsWith("b")) return /^b[01]+$/.test(rest);
+  return /^[0-9e]+$/.test(rest);
+}
+
 function isIdentifierChar(char: string | undefined): boolean {
-  return !!char && /^[A-Za-z0-9_$]$/.test(char);
+  return !!char && IDENTIFIER_PART_CHAR.test(char);
 }
 
 function readQuotedPart(text: string, start: number): IdentifierPart | null {
@@ -332,10 +376,14 @@ function readQuotedPart(text: string, start: number): IdentifierPart | null {
 }
 
 function readUnquotedPart(text: string, start: number): IdentifierPart | null {
-  if (!isIdentifierChar(text[start])) return null;
+  const first = text[start];
+  const startsWithDigit = !!first && /^[0-9]$/.test(first);
+  if (!isIdentifierStartChar(first) && !startsWithDigit) return null;
   let end = start + 1;
   while (end < text.length && isIdentifierChar(text[end])) end += 1;
-  return { value: text.slice(start, end), start, end, quoted: false };
+  const value = text.slice(start, end);
+  if (startsWithDigit && isNumberShapedToken(value)) return null;
+  return { value, start, end, quoted: false };
 }
 
 function readIdentifierPart(text: string, start: number): IdentifierPart | null {
@@ -643,7 +691,7 @@ export function splitQualifiedIdentifier(identifier: string): string[] {
 }
 
 /** Match identifier against known table names (case-insensitive). Supports qualified identifiers like schema.table. */
-export function matchTable<T extends { name: string; database?: string; schema?: string }>(identifier: string, tables: T[]): T | null {
+export function matchTable<T extends { name: string; database?: string; schema?: string }>(identifier: string, tables: readonly T[]): T | null {
   const parts = splitQualifiedIdentifier(identifier);
   const normalizedIdentifier = parts.length > 0 ? parts.join(".").toLowerCase() : identifier.toLowerCase();
 

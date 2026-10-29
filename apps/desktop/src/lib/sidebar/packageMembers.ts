@@ -1,5 +1,14 @@
 import type { CompletionAssistantCandidate, DatabaseType, TreeNode, TreeNodeType } from "@/types/database";
 
+const PACKAGE_MEMBER_GROUP_MARKER = ":members:";
+
+export function packageMemberGroupOwnerId(node: TreeNode): string | null {
+  if (node.parentType !== "package" || (node.type !== "group-procedures" && node.type !== "group-functions")) return null;
+  const markerIndex = node.id.lastIndexOf(PACKAGE_MEMBER_GROUP_MARKER);
+  if (markerIndex <= 0) return null;
+  return node.id.slice(0, markerIndex);
+}
+
 export function markPackageNodesExpandable(nodes: TreeNode[]): TreeNode[] {
   return nodes.map((node) => (node.type === "package" ? { ...node, children: node.children ?? [] } : node));
 }
@@ -24,9 +33,9 @@ function packageMemberGroup(packageNode: TreeNode, type: "procedure" | "function
   };
 }
 
-function packageMemberNode(packageNode: TreeNode, kind: "procedure" | "function", name: string, signature: string): TreeNode {
+function packageMemberNode(packageNode: TreeNode, kind: "procedure" | "function", name: string, signature: string, routineId?: string | null): TreeNode {
   return {
-    id: `${packageNode.id}:member:${kind}:${name}:${signature}`,
+    id: routineId ? `${packageNode.id}:member:${JSON.stringify([kind, routineId])}` : `${packageNode.id}:member:${kind}:${name}:${signature}`,
     label: signature ? `${name}(${signature})` : name,
     type: kind,
     objectName: name,
@@ -51,13 +60,13 @@ export function buildPackageMemberNodes(packageNode: TreeNode, candidates: reado
 
   for (const candidate of candidates) {
     if (candidate.kind !== "procedure" && candidate.kind !== "function") continue;
-    const name = candidate.name.trim();
-    if (!name) continue;
+    const name = databaseType === "oracle" || databaseType === "oceanbase-oracle" ? candidate.name : candidate.name.trim();
+    if (!name.trim()) continue;
     const signature = candidate.signature?.trim() || "";
-    const key = `${candidate.kind}\0${name}\0${signature}`;
+    const key = JSON.stringify([candidate.kind, name, candidate.routine_id ?? signature]);
     if (seen.has(key)) continue;
     seen.add(key);
-    const member = packageMemberNode(packageNode, candidate.kind, name, signature);
+    const member = packageMemberNode(packageNode, candidate.kind, name, signature, candidate.routine_id);
     members.push(member);
     if (candidate.kind === "procedure") procedures.push(member);
     else functions.push(member);

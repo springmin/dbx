@@ -1,6 +1,8 @@
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { nacosNamespaceIdentity } from "@/lib/nacos/nacosNamespaceVisibility";
-import { classifySqlRisk, isSqlRiskMutation } from "@/lib/sql/sqlRisk";
+import { classifySqlRisk, endsWithEscapeStringPrefix, isSqlRiskMutation, readOracleAlternativeQuoteEnd, usesMysqlLexerRules, usesOracleAlternativeQuotes, usesPostgresEscapeStrings } from "@/lib/sql/sqlRisk";
+
+export type ProductionConnection = Pick<ConnectionConfig, "db_type" | "is_production" | "production_databases">;
 
 export type ProductionContextReason = "connection" | "database" | "sql_target";
 
@@ -26,6 +28,7 @@ const COPY_TARGET_RE = new RegExp(String.raw`^\s*COPY\s+(${TARGET_NAME_PATTERN})
 const TRUNCATE_TARGET_RE = new RegExp(String.raw`\bTRUNCATE\s+(?:TABLE\s+)?(${TARGET_NAME_PATTERN})`, "gi");
 const RENAME_TABLE_TARGET_RE = new RegExp(String.raw`\bRENAME\s+TABLE\s+(${TARGET_NAME_PATTERN})\s+TO\s+(${TARGET_NAME_PATTERN})`, "gi");
 const MAINTENANCE_TABLE_TARGET_RE = new RegExp(String.raw`\b(?:ANALYZE|OPTIMIZE|REPAIR|CHECK)\s+(?:NO_WRITE_TO_BINLOG\s+|LOCAL\s+)?TABLE\s+(${TARGET_NAME_PATTERN})`, "gi");
+const VACUUM_TABLE_TARGET_RE = new RegExp(String.raw`\bVACUUM(?:\s+FULL)?(?:\s+ANALYZE)?\s+(${TARGET_NAME_PATTERN})`, "gi");
 const COMMENT_TARGET_RE = new RegExp(String.raw`\bCOMMENT\s+ON\s+(?:TABLE|VIEW|COLUMN|INDEX|SEQUENCE|FUNCTION|PROCEDURE|TYPE)\s+(${TARGET_NAME_PATTERN})`, "gi");
 const ROUTINE_CALL_TARGET_RE = new RegExp(String.raw`\b(?:CALL|EXEC|EXECUTE)\s+(${QUALIFIED_NAME_PATTERN})`, "gi");
 const PRIVILEGE_TARGET_RE = new RegExp(String.raw`\b(?:GRANT|REVOKE|DENY)\b[\s\S]*?\bON\s+(?:(?:TABLE|SEQUENCE|FUNCTION|PROCEDURE|ROUTINE|OBJECT)\s+|OBJECT\s*::\s*)?(${QUALIFIED_NAME_PATTERN})`, "gi");
@@ -60,6 +63,7 @@ const SCHEMA_FIRST_QUALIFIER_TYPES = new Set<DatabaseType>([
   "xugu",
   "oscar",
   "gbase",
+  "gbase8s",
   "saphana",
   "sqlserver",
   "snowflake",
@@ -92,7 +96,7 @@ export function normalizeProductionDatabase(value: string | undefined | null): s
     .toLowerCase();
 }
 
-export function productionDatabases(connection: ConnectionConfig | undefined): string[] {
+export function productionDatabases(connection: ProductionConnection | undefined): string[] {
   if (!connection?.production_databases?.length) return [];
   if (connection.db_type === "nacos") {
     return [...new Set(connection.production_databases.map(nacosNamespaceIdentity))];
@@ -100,7 +104,7 @@ export function productionDatabases(connection: ConnectionConfig | undefined): s
   return [...new Set(connection.production_databases.map(normalizeProductionDatabase).filter(Boolean))];
 }
 
-export function productionContextForDatabase(connection: ConnectionConfig | undefined, database: string | undefined | null): ProductionContext {
+export function productionContextForDatabase(connection: ProductionConnection | undefined, database: string | undefined | null): ProductionContext {
   if (!connection) return { active: false, databases: [] };
   if (connection.is_production) return { active: true, reason: "connection", databases: [] };
 
@@ -121,9 +125,9 @@ export function isProductionMutation(sql: string): boolean {
  * authoritative for ordinary statements; MySQL-style USE and qualified names
  * additionally protect production databases referenced from another context.
  */
-export function assessProductionSql(sql: string, connection: ConnectionConfig | undefined, activeDatabase: string | undefined | null): ProductionSqlAssessment {
+export function assessProductionSql(sql: string, connection: ProductionConnection | undefined, activeDatabase: string | undefined | null): ProductionSqlAssessment {
   const activeContext = productionContextForDatabase(connection, activeDatabase);
-  const targetText = sqlTargetSafetyText(sql);
+  const targetText = sqlTargetSafetyText(sql, connection?.db_type);
   const statements = splitTargetStatements(targetText.text);
   const risk = classifySqlRisk(sql, { dialect: connection?.db_type });
   const isMutation = isSqlRiskMutation(risk.risk);
@@ -159,7 +163,22 @@ function referencedDatabases(statements: string[], dbType: DatabaseType, activeD
     if (!statementIsMutation) continue;
     const currentDatabase = useDatabase || normalizedActiveDatabase;
 
-    collectQualifiedTargetDatabases(statement, dbType, quotedIdentifiers, currentDatabase, statementDatabases, DML_TARGET_RE, DDL_OBJECT_TARGET_RE, INDEX_ON_TARGET_RE, TRUNCATE_TARGET_RE, MAINTENANCE_TABLE_TARGET_RE, COMMENT_TARGET_RE, ROUTINE_CALL_TARGET_RE, PRIVILEGE_TARGET_RE);
+    collectQualifiedTargetDatabases(
+      statement,
+      dbType,
+      quotedIdentifiers,
+      currentDatabase,
+      statementDatabases,
+      DML_TARGET_RE,
+      DDL_OBJECT_TARGET_RE,
+      INDEX_ON_TARGET_RE,
+      TRUNCATE_TARGET_RE,
+      MAINTENANCE_TABLE_TARGET_RE,
+      VACUUM_TABLE_TARGET_RE,
+      COMMENT_TARGET_RE,
+      ROUTINE_CALL_TARGET_RE,
+      PRIVILEGE_TARGET_RE,
+    );
     collectQualifiedTargetDatabaseGroups(statement, dbType, quotedIdentifiers, currentDatabase, statementDatabases, RENAME_TABLE_TARGET_RE, [1, 2]);
     for (const match of statement.matchAll(DATABASE_TARGET_RE)) {
       const database = databaseTargetKindMeansDatabase(match[1], dbType) ? normalizeTargetDatabase(match[2], quotedIdentifiers) : "";
@@ -242,7 +261,22 @@ function splitTargetStatements(sql: string): string[] {
     .filter(Boolean);
 }
 
-function sqlTargetSafetyText(sql: string, quotedIdentifiers = new Map<string, string>()): SqlTargetSafetyText {
+/**
+ * Removes the text no database target can be found in. Everything removed here
+ * is text this gate cannot inspect, so reading MySQL lexer rules for a
+ * connection that has none hides writes: on SQL Server `#tmp` is a temporary
+ * table and T-SQL escapes a quote by doubling it, so both
+ * `SELECT * FROM #tmp; DELETE FROM prod_app.dbo.users;` and
+ * `SELECT 'dir\'; DELETE FROM prod_app.dbo.users;` would lose the `DELETE` and
+ * the write would no longer require confirmation.
+ *
+ * Mirrors `SqlScanLexerRules` in
+ * `crates/dbx-core/src/safety/production_safety.rs`.
+ */
+function sqlTargetSafetyText(sql: string, dialect?: DatabaseType | string, quotedIdentifiers = new Map<string, string>()): SqlTargetSafetyText {
+  const mysqlLexer = usesMysqlLexerRules(dialect);
+  const postgresEscapeStrings = usesPostgresEscapeStrings(dialect);
+  const oracleAlternativeQuotes = usesOracleAlternativeQuotes(dialect);
   let output = "";
   let index = 0;
 
@@ -257,7 +291,7 @@ function sqlTargetSafetyText(sql: string, quotedIdentifiers = new Map<string, st
       continue;
     }
 
-    if (char === "#") {
+    if (char === "#" && mysqlLexer) {
       index += 1;
       while (index < sql.length && sql[index] !== "\n" && sql[index] !== "\r") index += 1;
       output += " ";
@@ -270,7 +304,7 @@ function sqlTargetSafetyText(sql: string, quotedIdentifiers = new Map<string, st
       const executablePrefixLength = mysqlExecutableCommentPrefixLength(sql, index);
       if (executablePrefixLength > 0) {
         const bodyStart = skipExecutableCommentVersion(sql, index + executablePrefixLength);
-        output += ` ${sqlTargetSafetyText(sql.slice(bodyStart, close), quotedIdentifiers).text} `;
+        output += ` ${sqlTargetSafetyText(sql.slice(bodyStart, close), dialect, quotedIdentifiers).text} `;
       } else {
         output += " ";
       }
@@ -286,15 +320,25 @@ function sqlTargetSafetyText(sql: string, quotedIdentifiers = new Map<string, st
       continue;
     }
 
+    if (oracleAlternativeQuotes && (char === "q" || char === "Q" || char === "n" || char === "N")) {
+      const alternativeQuoteEnd = readOracleAlternativeQuoteEnd(sql, index);
+      if (alternativeQuoteEnd !== undefined) {
+        index = alternativeQuoteEnd;
+        output += " ";
+        continue;
+      }
+    }
+
     if (char === "'") {
-      index = readQuotedEnd(sql, index, "'", "'");
+      const backslashEscapes = mysqlLexer || (postgresEscapeStrings && endsWithEscapeStringPrefix(sql, index));
+      index = readQuotedEnd(sql, index, "'", "'", backslashEscapes);
       output += " ";
       continue;
     }
 
     if (char === '"' || char === "`" || char === "[") {
       const close = char === "[" ? "]" : char;
-      const end = readQuotedEnd(sql, index, char, close);
+      const end = readQuotedEnd(sql, index, char, close, mysqlLexer);
       const identifier = unquoteIdentifier(sql.slice(index, end), char, close).replace(/[;]/g, " ");
       const token = `__dbxq${quotedIdentifiers.size}__`;
       quotedIdentifiers.set(token.toLowerCase(), identifier);
@@ -327,10 +371,10 @@ function dollarQuoteTagAt(sql: string, index: number): string | undefined {
   return sql.slice(index).match(/^\$[A-Za-z_][A-Za-z0-9_]*\$|^\$\$/)?.[0];
 }
 
-function readQuotedEnd(sql: string, start: number, open: string, close: string): number {
+function readQuotedEnd(sql: string, start: number, open: string, close: string, backslashEscapes: boolean): number {
   let index = start + open.length;
   while (index < sql.length) {
-    if (sql[index] === "\\" && (open === "'" || open === '"')) {
+    if (backslashEscapes && sql[index] === "\\" && (open === "'" || open === '"')) {
       index += 2;
       continue;
     }

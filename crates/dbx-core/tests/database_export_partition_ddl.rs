@@ -13,10 +13,10 @@
 mod support;
 
 use std::process::Command;
+use std::sync::Arc;
 
 use dbx_core::connection::AppState;
 use dbx_core::database_export::{export_database_sql_core, DatabaseExportRequest};
-use dbx_core::storage::Storage;
 use support::{
     postgres_test_config, psql, psql_allow_failure, start_docker_postgres, start_docker_postgres_with_server_args,
     DockerPostgres,
@@ -75,8 +75,8 @@ async fn run_database_export_of_partition_tree_has_no_duplicates_and_replays() {
 
     let dir = std::env::temp_dir().join(format!("dbx-export-partition-ddl-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
-    let state = AppState::new(storage);
+    let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
+    let state = Arc::new(AppState::new(storage));
 
     let connection_id = "export-partition-ddl-conn";
     state.configs.write().await.insert(connection_id.to_string(), postgres_test_config(connection_id, container.port));
@@ -135,9 +135,15 @@ async fn run_database_export_of_partition_tree_has_no_duplicates_and_replays() {
         include_create_database: false,
         drop_table_if_exists: false,
         omit_auto_increment: false,
+        preserve_original_language: false,
         fail_on_error: true,
+        prevent_overwrite: false,
+        output_compression: Default::default(),
+        insert_dialect: Default::default(),
+        insert_mode: Default::default(),
         snapshot_session_id: None,
         batch_size: 1000,
+        split_max_mb: None,
     };
 
     export_database_sql_core(&state, &request, |_progress| {}).await.expect("export should succeed");
@@ -233,8 +239,8 @@ async fn partition_tree_ddl_query_count_does_not_scale_with_partition_count() {
 
     let dir = std::env::temp_dir().join(format!("dbx-partition-query-count-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
-    let state = AppState::new(storage);
+    let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
+    let state = Arc::new(AppState::new(storage));
     let connection_id = "partition-query-count-conn";
     state.configs.write().await.insert(connection_id.to_string(), postgres_test_config(connection_id, container.port));
 
@@ -301,8 +307,8 @@ async fn display_ddl_error_distinguishes_wrong_relkind_from_missing_relation() {
 
     let dir = std::env::temp_dir().join(format!("dbx-partition-relkind-error-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
-    let state = AppState::new(storage);
+    let storage = dbx_core::persistence::test_storage::open(&dir.join("storage.db")).await.unwrap();
+    let state = Arc::new(AppState::new(storage));
     let connection_id = "partition-relkind-error-conn";
     state.configs.write().await.insert(connection_id.to_string(), postgres_test_config(connection_id, container.port));
 

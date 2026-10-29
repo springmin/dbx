@@ -85,6 +85,7 @@ test("loads driver-reported identifier quotes for compatible JDBC connections", 
   assert.equal(connectionShouldLoadIdentifierQuote({ db_type: "jdbc", jdbc_driver_class: "org.opengauss.Driver" }), true);
   assert.equal(connectionShouldLoadIdentifierQuote({ db_type: "jdbc", jdbc_driver_class: "org.postgresql.Driver" }), true);
   assert.equal(connectionShouldLoadIdentifierQuote({ db_type: "kingbase" }), true);
+  assert.equal(connectionShouldLoadIdentifierQuote({ db_type: "kyuubi" }), true);
   assert.equal(connectionShouldLoadIdentifierQuote({ db_type: "gaussdb" }), true);
 });
 
@@ -139,10 +140,10 @@ test("keeps Phoenix on the generic JDBC metadata and object tree path", () => {
     jdbc_driver_class: "org.apache.phoenix.jdbc.PhoenixDriver",
   };
 
-  assert.equal(inferJdbcDialect(connection), undefined);
+  assert.equal(inferJdbcDialect(connection), "jdbc");
   assert.equal(effectiveDatabaseTypeForConnection(connection), "jdbc");
-  assert.equal(connectionShouldDiscoverJdbcSchemas(connection), true);
-  assert.equal(connectionUsesDatabaseObjectTreeMode(connection), true);
+  assert.equal(connectionShouldDiscoverJdbcSchemas(connection), false);
+  assert.equal(connectionUsesDatabaseObjectTreeMode(connection), false);
 });
 
 test("uses SQL Server editor syntax for ASE without changing its effective JDBC type", () => {

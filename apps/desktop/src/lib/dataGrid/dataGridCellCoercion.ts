@@ -1,60 +1,157 @@
 import type { GridCellValue } from "@/lib/dataGrid/dataGridSql";
 import type { DatabaseType, ColumnInfo } from "@/types/database";
-import { isNumericColumnType } from "@/lib/dataGrid/dataGridColumnType";
+import { binaryCellBytesToHexValue, binaryCellUtf8Text, decodeBinaryUuidText, isBinaryCellTextEditable } from "@/lib/dataGrid/binaryCellDownload";
+import { isNumericColumnType, isUuidColumnType, resolveDataGridTypeVisualKind } from "@/lib/dataGrid/dataGridColumnType";
+import { isBooleanColumnType } from "@/lib/dataGrid/dataGridBooleanColumn";
 
 export interface CoerceDataGridCellValueOptions {
   value: string;
   oldValue: GridCellValue | undefined;
   databaseType: DatabaseType | undefined;
   columnInfo: Pick<ColumnInfo, "data_type"> | undefined;
+  numberFormat?: NumericInputNumberFormat;
   preserveEmptyString?: boolean;
+  /** Treat an empty inline bulk edit as SQL NULL before type coercion. */
+  emptyStringAsNull?: boolean;
 }
+
+export interface NumericInputNumberFormat {
+  groupSeparator?: string;
+  decimalSeparator?: string;
+}
+
+let cachedRuntimeNumberFormat: NumericInputNumberFormat | undefined;
 
 export function coerceDataGridCellValue(options: CoerceDataGridCellValueOptions): GridCellValue {
   const { value, oldValue } = options;
-  if (value === "" && oldValue === null && !options.preserveEmptyString) return null;
+  if (value === "" && options.emptyStringAsNull) return null;
+  if (value === "" && oldValue === null && !keepsEmptyStringInColumn(options)) return null;
+  const uuidValue = coerceUuidTextValue(options);
+  if (uuidValue !== undefined) return uuidValue;
+  const blobValue = coerceBlobTextValue(options);
+  if (blobValue !== undefined) return blobValue;
   const postgresArrayValue = coercePostgresArrayValue(options);
   if (postgresArrayValue !== undefined) return postgresArrayValue;
-  // Excel-pasted values often carry thousands separators (10,000.00) that make
-  // Number() return NaN and the literal fail to convert on the server. Strip
-  // only unambiguous groupings and keep the normalized text for the precision
-  // checks below, so exact values survive as text.
-  const numericText = normalizeGroupedNumberText(value, options.columnInfo);
-  if (typeof oldValue === "number") {
+  // Excel-pasted values often carry separators that make Number() return NaN
+  // and the literal fail to convert on the server. Use the runtime number
+  // format to resolve single-comma values, then keep the normalized text for
+  // the precision checks below so exact values survive as text.
+  const useSampledValueType = normalizeDataType(options.columnInfo?.data_type) === "";
+  const numericInput = isNumericColumnType(options.columnInfo?.data_type) || (useSampledValueType && typeof oldValue === "number");
+  // A cleared numeric cell is SQL NULL; Number("") and Number(" ") would
+  // otherwise silently turn it into zero (#13755).
+  if (numericInput && value.trim() === "") return null;
+  const numericText = normalizeGroupedNumberText(value, options.columnInfo, oldValue, options.numberFormat ?? runtimeNumberFormat());
+  // Neo4j INTEGER is always signed 64-bit. Keep its input as text until the
+  // Cypher builder validates it, including values outside JavaScript's range.
+  if (options.databaseType === "neo4j" && ["integer", "long", "int"].includes(normalizeDataType(options.columnInfo?.data_type))) return numericText.trim();
+  if (isBooleanInputColumn(options) || (useSampledValueType && typeof oldValue === "boolean")) {
+    // MySQL exposes TINYINT(1) as an integer in the grid. Keep its numeric
+    // 0/1 edits numeric while still accepting explicit TRUE/FALSE aliases.
+    const booleanValue = parseBooleanInput(numericText, !isMysqlTinyintOneColumn(options));
+    if (booleanValue !== undefined) return booleanValue;
+  }
+  if (numericInput) {
     const num = Number(numericText);
     if (!Number.isNaN(num)) {
       if (shouldPreserveNumericText(options, num, numericText)) {
         // Keep precision-sensitive numeric edits as text; JS Number rounds 64-bit integers.
         const text = numericText.trim();
-        if (text === String(oldValue)) return oldValue;
+        if (oldValue !== undefined && text === String(oldValue)) return oldValue;
         return text;
       }
       return num;
     }
   }
-  if (typeof oldValue === "boolean") {
-    return numericText === "true" || numericText === "1";
-  }
   return normalizeSmartQuotedJsonInput(numericText);
+}
+
+// A literal empty string only exists in columns that store text. Every other
+// type — numeric, boolean, temporal, uuid, JSON, binary, arrays — has no ''
+// value of its own, so a blank cell in one of them has to stay NULL instead of
+// coercing to 0 / false / '' (issue #12727). Types the grid cannot classify
+// stay on the conservative NULL side as well.
+function keepsEmptyStringInColumn(options: CoerceDataGridCellValueOptions): boolean {
+  if (!options.preserveEmptyString) return false;
+  return resolveDataGridTypeVisualKind(options.columnInfo?.data_type, options.databaseType) === "string";
+}
+
+function isBooleanInputColumn(options: CoerceDataGridCellValueOptions): boolean {
+  if (isBooleanColumnType(options.columnInfo?.data_type, options.databaseType)) return true;
+  return options.databaseType === "mysql" && options.columnInfo?.data_type.trim().toLowerCase() === "tinyint(1)";
+}
+
+function isMysqlTinyintOneColumn(options: CoerceDataGridCellValueOptions): boolean {
+  return options.databaseType === "mysql" && options.columnInfo?.data_type.trim().toLowerCase() === "tinyint(1)";
+}
+
+function parseBooleanInput(value: string, allowNumericAliases: boolean): boolean | undefined {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  if (allowNumericAliases && normalized === "1") return true;
+  if (allowNumericAliases && normalized === "0") return false;
+  return undefined;
 }
 
 export function dataGridCellEditorText(options: { value: GridCellValue | undefined; databaseType: DatabaseType | undefined; columnInfo: Pick<ColumnInfo, "data_type"> | undefined }): string {
   const value = options.value ?? null;
   if (value === null) return "";
+  const uuidText = decodeBinaryUuidText(value, options.columnInfo?.data_type);
+  if (uuidText !== null) return uuidText;
+  if (isBinaryCellTextEditable(options.columnInfo?.data_type, options.databaseType)) {
+    const text = binaryCellUtf8Text(value, options.columnInfo?.data_type, options.databaseType);
+    if (text !== null) return text;
+  }
   if (Array.isArray(value) && options.databaseType === "postgres" && isPostgresArrayColumn(options.columnInfo, value)) {
     return formatPostgresArrayText(value);
   }
   return typeof value === "object" ? JSON.stringify(value) : String(value);
 }
 
+function coerceUuidTextValue(options: CoerceDataGridCellValueOptions): GridCellValue | undefined {
+  if (!isUuidColumnType(options.columnInfo?.data_type)) return undefined;
+  const originalUuid = decodeBinaryUuidText(options.oldValue, options.columnInfo?.data_type);
+  if (originalUuid !== null) {
+    if (options.value === originalUuid) return options.oldValue;
+    if (options.value.trim() === "") return null;
+    return options.value.trim();
+  }
+  if (typeof options.oldValue === "string") {
+    if (options.value === options.oldValue) return options.oldValue;
+    if (options.value.trim() === "") return null;
+    return options.value.trim();
+  }
+  if (options.value.trim() === "") return null;
+  return options.value.trim();
+}
+
+function coerceBlobTextValue(options: CoerceDataGridCellValueOptions): GridCellValue | undefined {
+  if (!isBinaryCellTextEditable(options.columnInfo?.data_type, options.databaseType)) return undefined;
+  const originalText = binaryCellUtf8Text(options.oldValue, options.columnInfo?.data_type, options.databaseType);
+  if (originalText === null) return undefined;
+  if (options.value === originalText) return options.oldValue;
+  return binaryCellBytesToHexValue(new TextEncoder().encode(options.value));
+}
+
 export function dataGridCellDisplayText(options: { value: GridCellValue; databaseType: DatabaseType | undefined; columnInfo: Pick<ColumnInfo, "data_type"> | undefined }): string | undefined {
   if (Array.isArray(options.value) && options.databaseType === "postgres" && isPostgresArrayColumn(options.columnInfo, options.value)) {
     return formatPostgresArrayText(options.value);
+  }
+  if (typeof options.value === "string") {
+    const timestampDisplay = normalizeTimestampFractionDisplayText(options.value, options.columnInfo?.data_type);
+    if (timestampDisplay !== options.value) return timestampDisplay;
   }
   if (typeof options.value === "string" && isOracleDateColumn(options.databaseType, options.columnInfo)) {
     return formatOracleDateDisplayText(options.value);
   }
   return undefined;
+}
+
+function normalizeTimestampFractionDisplayText(value: string, dataType: string | undefined): string {
+  if (!/^timestamp(?:\s*\([^)]*\))?(?:\s+(?:with|without)\s+time\s+zone)?$/i.test(dataType?.trim() ?? "")) return value;
+  const match = value.match(/^(\d{4}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{1,2}:\d{1,2})\.(\d{1,2})(Z|[+-]\d{2}:?\d{2})?$/);
+  return match ? `${match[1]}.${match[2].padEnd(3, "0")}${match[3] ?? ""}` : value;
 }
 
 function coercePostgresArrayValue(options: CoerceDataGridCellValueOptions): unknown[] | undefined {
@@ -103,22 +200,38 @@ function shouldPreserveNumericText(options: CoerceDataGridCellValueOptions, pars
   return shouldPreserveNumericTextForType(options.columnInfo?.data_type, text, parsedNumber);
 }
 
-function normalizeGroupedNumberText(value: string, columnInfo: Pick<ColumnInfo, "data_type"> | undefined): string {
-  if (!isNumericColumnType(columnInfo?.data_type)) return value;
-  return stripUnambiguousThousandSeparators(value);
+function normalizeGroupedNumberText(value: string, columnInfo: Pick<ColumnInfo, "data_type"> | undefined, oldValue: GridCellValue | undefined, numberFormat: NumericInputNumberFormat): string {
+  const useSampledNumberType = normalizeDataType(columnInfo?.data_type) === "" && typeof oldValue === "number";
+  if (!isNumericColumnType(columnInfo?.data_type) && !useSampledNumberType) return value;
+  return normalizeCommaSeparatedNumberText(value, numberFormat);
 }
 
-function stripUnambiguousThousandSeparators(value: string): string {
+function normalizeCommaSeparatedNumberText(value: string, numberFormat: NumericInputNumberFormat): string {
   const trimmed = value.trim();
   const match = trimmed.match(/^([+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?)([eE][+-]?\d+)?$/);
   if (!match) return value;
   const mantissa = match[1];
   const exponent = match[2] ?? "";
-  // A lone "1,000" (one comma group, no decimal point) is ambiguous: in
-  // comma-decimal locales it reads as 1.000. Only strip when a decimal point
-  // is present (1,234.56) or there are multiple comma groups (1,234,567).
-  if (/^[+-]?\d{1,3},\d{3}$/.test(mantissa)) return value;
+  if (/^[+-]?\d{1,3},\d{3}$/.test(mantissa)) {
+    if (numberFormat.groupSeparator === "," && numberFormat.decimalSeparator !== ",") {
+      return `${mantissa.replace(",", "")}${exponent}`;
+    }
+    if (numberFormat.decimalSeparator === ",") {
+      return `${mantissa.replace(",", ".")}${exponent}`;
+    }
+    return value;
+  }
   return `${mantissa.replace(/,/g, "")}${exponent}`;
+}
+
+function runtimeNumberFormat(): NumericInputNumberFormat {
+  if (cachedRuntimeNumberFormat) return cachedRuntimeNumberFormat;
+  const parts = new Intl.NumberFormat().formatToParts(12345.6);
+  cachedRuntimeNumberFormat = {
+    groupSeparator: parts.find((part) => part.type === "group")?.value,
+    decimalSeparator: parts.find((part) => part.type === "decimal")?.value,
+  };
+  return cachedRuntimeNumberFormat;
 }
 
 function postgresArrayElementDataType(dataType: string | undefined): string {

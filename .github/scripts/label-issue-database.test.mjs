@@ -21,8 +21,8 @@ function issueWithDatabase(database, title = "[Bug]") {
 }
 
 function matchedLabels(database, title) {
-  return triageIssue(issueWithDatabase(database, title)).summary.labelsToAdd
-    .filter((label) => label.startsWith("db/"))
+  return triageIssue(issueWithDatabase(database, title))
+    .summary.labelsToAdd.filter((label) => label.startsWith("db/"))
     .sort();
 }
 
@@ -35,10 +35,7 @@ test("database issue catalog covers every DatabaseType", () => {
 test("database label synchronization includes every catalog entry once", () => {
   const labelNames = allDatabaseLabelSpecs().map((label) => label.name);
   assert.equal(new Set(labelNames).size, databaseIssueDrivers.length);
-  assert.deepEqual(
-    labelNames.sort(),
-    databaseIssueDrivers.map((driver) => `db/${driver.dbType}`).sort(),
-  );
+  assert.deepEqual(labelNames.sort(), databaseIssueDrivers.map((driver) => `db/${driver.dbType}`).sort());
 });
 
 test("Kingbase aliases retain historical and current company names", () => {
@@ -48,6 +45,14 @@ test("Kingbase aliases retain historical and current company names", () => {
   assert.equal(kingbase.aliases.includes("金仓"), true);
   assert.equal(kingbase.aliases.includes("电科金仓"), true);
   assert.equal(kingbase.aliases.includes("中电科金仓"), false);
+});
+
+test("supplemental aliases merge into manifest entries without duplicating labels", () => {
+  const mqttEntries = databaseIssueDrivers.filter((driver) => driver.dbType === "mqtt");
+  assert.equal(mqttEntries.length, 1);
+  assert.equal(mqttEntries[0].aliases.includes("emqx"), true);
+  assert.equal(mqttEntries[0].aliases.includes("hivemq"), true);
+  assert.equal(mqttEntries[0].aliases.includes("mosquitto"), true);
 });
 
 test("labels native and compatibility database products with their families", () => {

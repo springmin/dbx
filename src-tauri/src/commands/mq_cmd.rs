@@ -126,6 +126,17 @@ pub async fn mq_list_topics(
 }
 
 #[tauri::command]
+pub async fn mq_list_topics_page(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    ns: dbx_core::mq::NamespaceRef,
+    opts: dbx_core::mq::ListTopicsOpts,
+    pagination: dbx_core::mq::MqListPageRequest,
+) -> Result<dbx_core::mq::MqListPage<dbx_core::mq::TopicInfo>, String> {
+    dbx_core::mq::service::mq_list_topics_page_core(&state, &connection_id, ns, opts, pagination).await
+}
+
+#[tauri::command]
 pub async fn mq_create_topic(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -185,6 +196,16 @@ pub async fn mq_list_exchanges(
     ns: dbx_core::mq::NamespaceRef,
 ) -> Result<Vec<dbx_core::mq::MqExchangeInfo>, String> {
     dbx_core::mq::service::mq_list_exchanges_core(&state, &connection_id, ns).await
+}
+
+#[tauri::command]
+pub async fn mq_list_exchanges_page(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    ns: dbx_core::mq::NamespaceRef,
+    pagination: dbx_core::mq::MqListPageRequest,
+) -> Result<dbx_core::mq::MqListPage<dbx_core::mq::MqExchangeInfo>, String> {
+    dbx_core::mq::service::mq_list_exchanges_page_core(&state, &connection_id, ns, pagination).await
 }
 
 #[tauri::command]
@@ -274,6 +295,14 @@ pub async fn mq_enrich_subscriptions(
     topic: dbx_core::mq::TopicRef,
 ) -> Result<Vec<dbx_core::mq::SubscriptionInfo>, String> {
     dbx_core::mq::service::mq_enrich_subscriptions_core(&state, &connection_id, topic).await
+}
+
+#[tauri::command]
+pub async fn mq_get_kafka_consumer_group_snapshot(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Result<dbx_core::mq::KafkaConsumerGroupSnapshot, String> {
+    dbx_core::mq::service::mq_get_kafka_consumer_group_snapshot_core(&state, &connection_id).await
 }
 
 #[tauri::command]

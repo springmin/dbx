@@ -16,6 +16,27 @@ use tokio_util::sync::CancellationToken;
 
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[path = "../../../../crates/dbx-core/tests/support/duckdb_export.rs"]
+mod export_regressions;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_query_pages_preserve_one_execution() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    export_regressions::run_query_pages(PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_parquet_exports_preserve_rows_and_project_totals() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    export_regressions::run_parquet_exports(PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_export_snapshots_preserve_values_and_cleanup() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    export_regressions::run_snapshot_cleanup(PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver")));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_process_reads_view_source() {
     let _guard = duckdb_worker_process_test_guard().await;
@@ -351,6 +372,7 @@ async fn worker_process_exits_when_stdin_closes_during_active_query() {
                 sql: "SELECT sum(sin(i::DOUBLE) * cos(i::DOUBLE / 3.0)) FROM range(100000000000) AS t(i)".to_string(),
                 database: None,
                 max_rows: Some(10),
+                preserve_insertion_order: false,
             },
         )
         .expect("execute request"),
@@ -499,6 +521,56 @@ async fn worker_process_retries_connect_after_transient_file_lock() {
     assert_eq!(result.rows, vec![vec![serde_json::json!(42)]]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_shutdown_checkpoints_and_removes_wal() {
+    let _guard = duckdb_worker_process_test_guard().await;
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_dbx-duckdb-driver"));
+    let db_path = temp_duckdb_path();
+    let wal_path = wal_path_for(&db_path);
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&wal_path);
+
+    let client = DuckDbWorkerClient::open_with_executable(
+        executable.clone(),
+        db_path.to_string_lossy().to_string(),
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("worker process connects");
+    client
+        .execute(
+            None,
+            "CREATE TABLE events (id INTEGER); INSERT INTO events VALUES (7);".to_string(),
+            Some(10),
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("write events");
+
+    // Committed writes sit in the WAL while the connection is open.
+    assert!(wal_path.exists(), "committed writes should leave a WAL file next to the database");
+
+    client.shutdown().await;
+
+    assert!(!wal_path.exists(), "shutdown should checkpoint and remove the WAL file");
+
+    // The checkpointed data survives a fresh open of the database file.
+    let client =
+        DuckDbWorkerClient::open_with_executable(executable, db_path.to_string_lossy().to_string(), Vec::new(), None)
+            .await
+            .expect("reopen after shutdown");
+    let result = client
+        .execute(None, "SELECT id FROM events".to_string(), Some(10), None, Some(Duration::from_secs(5)))
+        .await
+        .expect("read events back");
+    assert_eq!(result.rows, vec![vec![serde_json::json!(7)]]);
+    client.shutdown().await;
+    assert!(!wal_path.exists(), "second shutdown should also remove the WAL file");
+    let _ = std::fs::remove_file(&db_path);
+}
+
 async fn write_worker_request(stdin: &mut tokio::process::ChildStdin, request: DuckDbWorkerRequest) {
     let line = serde_json::to_string(&request).expect("request json");
     stdin.write_all(line.as_bytes()).await.expect("write request");
@@ -515,6 +587,10 @@ async fn read_worker_response(
         .expect("read worker response")
         .expect("worker response line");
     serde_json::from_str(&line).expect("parse worker response")
+}
+
+fn wal_path_for(db_path: &PathBuf) -> PathBuf {
+    PathBuf::from(format!("{}.wal", db_path.display()))
 }
 
 fn temp_duckdb_path() -> PathBuf {

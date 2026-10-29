@@ -67,7 +67,7 @@ export function isFlatMqSystemKind(kind: MqSystemKind | undefined): boolean {
   return kind === "kafka" || kind === "rocketmq" || kind === "rabbitmq";
 }
 
-export function defaultMqCapabilitiesForSystemKind(kind: MqSystemKind | undefined): MqCapabilities {
+export function defaultMqCapabilitiesForSystemKind(kind: MqSystemKind | undefined, config?: ConnectionConfig): MqCapabilities {
   if (kind === "kafka") {
     return {
       ...FLAT_MQ_BASE_CAPABILITIES,
@@ -76,6 +76,27 @@ export function defaultMqCapabilitiesForSystemKind(kind: MqSystemKind | undefine
     };
   }
   if (kind === "rocketmq") {
+    const extra = (config?.external_config as Partial<MqAdminConfig> | undefined)?.extra as Record<string, unknown> | undefined;
+    if (extra?.connectionMode === "proxy") {
+      return {
+        ...FLAT_MQ_BASE_CAPABILITIES,
+        supportsPartitionedTopics: false,
+        supportsSubscriptions: false,
+        supportsResetCursor: false,
+        supportsClearBacklog: false,
+        supportsPeekMessages: false,
+        supportsPermissions: false,
+        supportsListTopics: false,
+        supportsCreateTopic: false,
+        supportsDeleteTopic: false,
+        supportsTopicStats: false,
+        supportsBrokerAdmin: false,
+        supportsProducerListing: false,
+        supportsMessageQuery: false,
+        supportsMessageTrace: false,
+        supportsDlq: false,
+      };
+    }
     return {
       ...FLAT_MQ_BASE_CAPABILITIES,
       supportsMessageQuery: true,
@@ -158,12 +179,16 @@ export function resolveRabbitMqDefaultVhost(config: ConnectionConfig | undefined
   return typeof vhost === "string" && vhost.trim() ? vhost.trim() : "/";
 }
 
-export type MqTab = "tenants" | "namespaces" | "topics" | "subscriptions" | "monitoring" | "clients" | "producers" | "policies" | "permissions" | "messages" | "raw" | "broker" | "dlq" | "trace";
+export type MqTab = "tenants" | "namespaces" | "topics" | "subscriptions" | "consumerGroups" | "monitoring" | "clients" | "producers" | "policies" | "permissions" | "messages" | "raw" | "broker" | "dlq" | "trace";
 
 export function resolveAvailableMqTabs(options: { systemKind?: MqSystemKind; capabilities: MqCapabilities }): MqTab[] {
   const { systemKind, capabilities } = options;
   if (systemKind === "rocketmq") {
-    const tabs: MqTab[] = ["broker", "topics", "subscriptions", "producers"];
+    const tabs: MqTab[] = [];
+    if (capabilities.supportsBrokerAdmin !== false) tabs.push("broker");
+    if (capabilities.supportsListTopics !== false) tabs.push("topics");
+    if (capabilities.supportsSubscriptions) tabs.push("subscriptions");
+    if (capabilities.supportsProducerListing !== false) tabs.push("producers");
     if (capabilities.supportsMessageQuery || capabilities.supportsSendMessage) tabs.push("messages");
     if (capabilities.supportsMessageTrace) tabs.push("trace");
     if (capabilities.supportsPermissions) tabs.push("permissions");
@@ -174,7 +199,10 @@ export function resolveAvailableMqTabs(options: { systemKind?: MqSystemKind; cap
   if (capabilities.supportsTenants) tabs.push("tenants");
   if (capabilities.supportsNamespaces) tabs.push("namespaces");
   tabs.push("topics");
-  if (capabilities.supportsSubscriptions) tabs.push("subscriptions");
+  if (capabilities.supportsSubscriptions) {
+    tabs.push("subscriptions");
+    if (systemKind === "kafka") tabs.push("consumerGroups");
+  }
   tabs.push("monitoring");
   tabs.push("clients");
   if (capabilities.supportsSendMessage || (systemKind === "kafka" && capabilities.supportsPeekMessages)) tabs.push("messages");

@@ -6,13 +6,19 @@ import { dirname, join, resolve } from "node:path";
 
 const LOCALES_DIR = "apps/desktop/src/i18n/locales";
 const SOURCE_LOCALE = "zh-CN";
-const TARGET_LOCALES = ["en", "es", "it", "ja", "pt-BR", "zh-TW"];
+const TARGET_LOCALES = ["en", "es", "it", "ja", "ko", "pt-BR", "ru", "th", "zh-TW"];
+// `git show <ref>:<path>` needs forward slashes even on Windows, where
+// `path.join()` yields backslashes. Allow an override (CI keeps the default).
+const refPath = (path) => path.replaceAll("\\", "/");
 const TARGET_LABELS = {
   en: "English",
   es: "Spanish",
   it: "Italian",
   ja: "Japanese",
+  ko: "Korean",
   "pt-BR": "Brazilian Portuguese",
+  ru: "Russian",
+  th: "Thai",
   "zh-TW": "Traditional Chinese used in Taiwan",
 };
 
@@ -106,7 +112,7 @@ function localePath(locale) {
 
 function readBaseFile(path) {
   try {
-    return execFileSync("git", ["show", `${baseRef}:${path}`], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+    return execFileSync("git", ["show", `${baseRef}:${refPath(path)}`], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   } catch (error) {
     throw new Error(`Unable to read ${path} from ${baseRef}: ${error.message}`);
   }

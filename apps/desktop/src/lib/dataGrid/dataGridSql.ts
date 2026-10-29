@@ -1,5 +1,6 @@
 import type { DatabaseType } from "@/types/database";
 import * as api from "@/lib/backend/api";
+import { formatError } from "@/lib/backend/errorUtils";
 
 export type GridCellValue = string | number | boolean | null | unknown[] | { [key: string]: unknown };
 
@@ -24,6 +25,9 @@ export interface DataGridColumnInfo {
 
 export interface DataGridSaveStatementOptions {
   databaseType?: DatabaseType;
+  /** Server version reported by the connection (see `BuildTableSelectSqlOptions.serverVersion`).
+   * The saved statements must address rows the same way the grid read them. */
+  serverVersion?: string;
   identifierQuote?: string;
   tableMeta: DataGridTableMeta;
   columns: string[];
@@ -32,6 +36,8 @@ export interface DataGridSaveStatementOptions {
   dirtyRows: Array<[number, Array<[number, GridCellValue]>]>;
   deletedRows: number[];
   newRows: GridCellValue[][];
+  /** `生成 SQL 时包含数据库名`: qualify `database.table` engines in the save SQL. */
+  includeDatabaseName?: boolean;
 }
 
 export interface DataGridCopyUpdateStatementOptions {
@@ -53,12 +59,13 @@ export interface DataGridCopyInsertStatementOptions {
   columnTypes?: Array<string | null | undefined>;
   sourceColumns?: Array<string | undefined>;
   rows: GridCellValue[][];
-  excludePrimaryKeys?: boolean;
+  primaryKeyMode?: "include" | "exclude-generated" | "exclude-all";
   includeComputedColumns?: boolean;
+  includeDatabaseName?: boolean;
   insertMode?: DataGridCopyInsertMode;
 }
 
-export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "like" | "not-like" | "less-than" | "less-than-or-equal" | "greater-than" | "greater-than-or-equal" | "in" | "not-in" | "between" | "not-between";
+export type DataGridContextFilterMode = "equals" | "not-equals" | "is-null" | "is-not-null" | "is-blank" | "is-not-blank" | "like" | "not-like" | "begins-with" | "ends-with" | "less-than" | "less-than-or-equal" | "greater-than" | "greater-than-or-equal" | "in" | "not-in" | "between" | "not-between";
 
 export interface DataGridContextFilterConditionOptions {
   databaseType?: DatabaseType;
@@ -89,6 +96,7 @@ export interface DataGridColumnValuesFilterConditionOptions {
 
 export interface DataGridColumnDistinctValuesSqlOptions {
   databaseType?: DatabaseType;
+  driverProfile?: string;
   identifierQuote?: string;
   catalog?: string;
   database?: string;
@@ -100,6 +108,7 @@ export interface DataGridColumnDistinctValuesSqlOptions {
   searchValue?: string;
   limit?: number;
   includeCounts?: boolean;
+  excludeNulls?: boolean;
 }
 
 export interface DataGridCountSqlOptions {
@@ -115,7 +124,17 @@ export interface DataGridCountSqlOptions {
   countHint?: string;
 }
 
+export interface DataGridConditionalUpdateSqlOptions {
+  databaseType?: DatabaseType;
+  identifierQuote?: string;
+  tableMeta: DataGridTableMeta;
+  columnName: string;
+  value: GridCellValue;
+  whereInput: string;
+}
+
 export interface HiveTablePropertiesSqlOptions {
+  databaseType?: DatabaseType;
   schema?: string;
   tableName: string;
   propertyName: string;
@@ -149,13 +168,24 @@ export function buildDataGridCountSql(options: DataGridCountSqlOptions): Promise
   return api.buildDataGridCountSql(options);
 }
 
+export function buildDataGridConditionalUpdateSql(options: DataGridConditionalUpdateSqlOptions): Promise<string | undefined> {
+  return api.buildDataGridConditionalUpdateSql(options);
+}
+
 export function buildHiveTablePropertiesSql(options: HiveTablePropertiesSqlOptions): Promise<string> {
   return api.buildHiveTablePropertiesSql(options);
 }
 
+function formatDataGridSaveError(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return formatError(error);
+}
+
 export function normalizeDataGridSaveError(databaseType: DatabaseType | undefined, error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  if (databaseType === "hive" && /Attempt to do update or delete|Error 10294/i.test(message)) {
+  const message = formatDataGridSaveError(error);
+  if ((databaseType === "hive" || databaseType === "argo") && /Attempt to do update or delete|Error 10294/i.test(message)) {
     return "Hive UPDATE/DELETE are not enabled for this table or server. Add rows with INSERT, or enable ACID transactional tables in Hive before editing/deleting existing rows.";
   }
   return message;

@@ -8,6 +8,7 @@ import {
   middleEllipsis,
   nextExecutionSummaryView,
   resultGridCacheKey,
+  resultGridColumnWidthCacheKey,
   resultRunItems,
   resultSourceRange,
   resultSqlForGrid,
@@ -18,7 +19,14 @@ import {
 import i18n, { setLocale } from "../../apps/desktop/src/i18n/index.ts";
 import { restoreOpenTabsState } from "../../apps/desktop/src/lib/app/openTabsPersistence.ts";
 import { useConnectionStore } from "../../apps/desktop/src/stores/connectionStore.ts";
+import { useSettingsStore } from "../../apps/desktop/src/stores/settingsStore.ts";
 import type { ConnectionConfig, QueryResult, QueryTab } from "../../apps/desktop/src/types/database.ts";
+
+function activateTestPinia() {
+  setActivePinia(createPinia());
+  // Keep legacy title assertions explicit now that compact titles are the default.
+  useSettingsStore().editorSettings.compactTabTitle = false;
+}
 
 function installMemoryStorage() {
   const values = new Map<string, string>();
@@ -75,7 +83,7 @@ function result(columns: string[], overrides: Partial<QueryResult> = {}): QueryR
 
 test("query tab display title uses custom title when present", () => {
   const restoreStorage = installMemoryStorage();
-  setActivePinia(createPinia());
+  activateTestPinia();
   useConnectionStore().addEphemeralConnection(conn("conn-1"));
   const t = (key: string) => key;
 
@@ -89,7 +97,7 @@ test("query tab display title uses custom title when present", () => {
 
 test("restored MQTT tab titles ignore legacy persisted text and follow the current locale", async () => {
   const restoreStorage = installMemoryStorage();
-  setActivePinia(createPinia());
+  activateTestPinia();
   useConnectionStore().addEphemeralConnection({
     ...conn("conn-1"),
     name: "test-mqtt",
@@ -124,7 +132,7 @@ test("restored MQTT tab titles ignore legacy persisted text and follow the curre
 
 test("jdbc tabs use the connection target when database is empty", () => {
   const restoreStorage = installMemoryStorage();
-  setActivePinia(createPinia());
+  activateTestPinia();
   useConnectionStore().addEphemeralConnection({
     ...conn("conn-1"),
     db_type: "jdbc",
@@ -157,7 +165,7 @@ test("jdbc tabs use the connection target when database is empty", () => {
 
 test("zookeeper tabs use key browser labels", () => {
   const restoreStorage = installMemoryStorage();
-  setActivePinia(createPinia());
+  activateTestPinia();
   useConnectionStore().addEphemeralConnection({
     ...conn("conn-1"),
     name: "ZK Prod",
@@ -177,7 +185,7 @@ test("zookeeper tabs use key browser labels", () => {
 
 test("HBase tabs identify the table and namespace", () => {
   const restoreStorage = installMemoryStorage();
-  setActivePinia(createPinia());
+  activateTestPinia();
   useConnectionStore().addEphemeralConnection({
     ...conn("conn-1"),
     name: "HBase Dev",
@@ -197,7 +205,7 @@ test("HBase tabs identify the table and namespace", () => {
 
 test("GridFS tabs use dedicated titles and labels", () => {
   const restoreStorage = installMemoryStorage();
-  setActivePinia(createPinia());
+  activateTestPinia();
   useConnectionStore().addEphemeralConnection({
     ...conn("conn-1"),
     name: "uat-mongo",
@@ -324,6 +332,7 @@ test("result run items expose ordered labels and active state", () => {
         sequence: 1,
         sql: "select 1",
         createdAt: 10,
+        pinned: true,
         result: result(["one"]),
       },
       {
@@ -338,8 +347,8 @@ test("result run items expose ordered labels and active state", () => {
   });
 
   assert.deepEqual(resultRunItems(tab), [
-    { id: "run-1", title: "Run 1", sequence: 1, active: false },
-    { id: "run-2", title: "Run 2", sequence: 2, active: true },
+    { id: "run-1", title: "", sequence: 1, active: false, pinned: true, sourceLabel: undefined },
+    { id: "run-2", title: "", sequence: 2, active: true, pinned: false, sourceLabel: undefined },
   ]);
   assert.equal(activeResultRun(tab)?.id, "run-2");
   assert.deepEqual(
@@ -353,6 +362,15 @@ test("result grid cache key includes result run id and statement result index", 
 
   assert.equal(resultGridCacheKey(tab), "tab-1-run-7-3");
   assert.equal(resultGridCacheKey(queryTab({ activeResultIndex: undefined })), "tab-1-current-0");
+});
+
+test("result grid column width cache key ignores result run id and isolates result indexes", () => {
+  const first = queryTab({ activeResultRunId: "run-1", activeResultIndex: 2 });
+  const rerun = queryTab({ activeResultRunId: "run-2", activeResultIndex: 2 });
+
+  assert.equal(resultGridColumnWidthCacheKey(first), "result-column-width-tab-1-2");
+  assert.equal(resultGridColumnWidthCacheKey(rerun), resultGridColumnWidthCacheKey(first));
+  assert.notEqual(resultGridColumnWidthCacheKey(queryTab({ activeResultIndex: 1 })), resultGridColumnWidthCacheKey(first));
 });
 
 test("execution summary items include table and non-table statement results", () => {

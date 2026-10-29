@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
+mod clipboard_history;
 mod drag_drop;
 mod util;
 
@@ -31,7 +32,7 @@ use super::Theme;
 use crate::{
   custom_protocol_workaround, proxy::ProxyConfig, Error, MemoryUsageLevel, NewWindowFeatures,
   NewWindowOpener, NewWindowResponse, PageLoadEvent, Rect, RequestAsyncResponder, Result,
-  WebViewAttributes, RGBA,
+  WebView2ProcessFailedInfo, WebView2ProcessFailedKind, WebViewAttributes, RGBA,
 };
 
 type EventRegistrationToken = i64;
@@ -74,6 +75,7 @@ impl Drop for InnerWebView {
       let _ = unsafe { DestroyWindow(self.hwnd) };
     }
     unsafe { Self::dettach_parent_subclass(*self.parent.borrow()) }
+    unsafe { clipboard_history::detach(*self.parent.borrow()) }
   }
 }
 
@@ -284,14 +286,22 @@ impl InnerWebView {
     attributes: &WebViewAttributes,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
   ) -> Result<ICoreWebView2Environment> {
-    let data_directory = attributes
-      .context
-      .as_deref()
-      .and_then(|context| context.data_directory())
-      .map(HSTRING::from);
+    // DBX patch: the WebView2 user data folder can be redirected at runtime
+    // through `WEBVIEW2_USER_DATA_FOLDER`. The startup compatibility ladder
+    // uses this to retry a blocked launch with a fresh user data directory
+    // (AV products and broken sandbox profiles often leave the default folder
+    // unusable). Upstream wry only lets `WebContext::new` decide this, which
+    // cannot change between startup attempts.
+    let data_directory = user_data_folder_from_environment().or_else(|| {
+      attributes
+        .context
+        .as_deref()
+        .and_then(|context| context.data_directory())
+        .map(HSTRING::from)
+    });
 
     // additional browser args
-    let additional_browser_args = pl_attrs.additional_browser_args.unwrap_or_else(|| {
+    let configured_browser_args = pl_attrs.additional_browser_args.unwrap_or_else(|| {
       // remove "mini menu" - See https://github.com/tauri-apps/wry/issues/535
       // and "smart screen" - See https://github.com/tauri-apps/tauri/issues/1345
       let default_args = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
@@ -320,6 +330,19 @@ impl InnerWebView {
 
       arguments
     });
+
+    // DBX patch: merge `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` into the browser
+    // arguments that are actually passed to
+    // `CreateCoreWebView2EnvironmentWithOptions`. The WebView2 loader only
+    // reads that environment variable when the additional arguments option is
+    // *not* set, and wry always sets it, so without this merge every runtime
+    // env override (notably the `--no-sandbox` / `--disable-gpu` /
+    // `--disable-features=RendererCodeIntegrity` set used by DBX's enterprise
+    // startup compatibility profiles) was silently ignored.
+    let additional_browser_args = match additional_browser_args_from_environment() {
+      Some(extra) => merge_browser_arguments(&configured_browser_args, &extra),
+      None => configured_browser_args,
+    };
 
     let (tx, rx) = mpsc::channel();
     let options = CoreWebView2EnvironmentOptions::default();
@@ -497,6 +520,32 @@ impl InnerWebView {
       controller.add_AcceleratorKeyPressed(&accelerator_key_handler, &mut token)?;
     }
 
+    // Detect WebView2 child-process failures while the host process stays
+    // alive: losing the renderer/GPU process group turns the window black
+    // with nothing to repaint it (reproduced after an overnight idle session,
+    // see t8y2/dbx#6362). wry only detects and constructs a structured
+    // [`WebView2ProcessFailedInfo`] signal here — the application layer
+    // (registered via [`crate::set_webview2_process_failed_callback`])
+    // decides recovery (reload / restart / log-only), so wry never learns
+    // about application state. Every event is also logged locally with full
+    // forensics so the real kind/reason on affected Windows devices can be
+    // collected — the issue only proves the process group disappeared, not
+    // which event actually fired.
+    unsafe {
+      let process_failed_handler = ProcessFailedEventHandler::create(Box::new(
+        move |_, args| {
+          let Some(args) = args else { return Ok(()) };
+          let info = process_failed_info(&args);
+          record_process_failure(&info);
+          if let Some(callback) = webview2_process_failed_callback() {
+            callback(&info);
+          }
+          Ok(())
+        },
+      ));
+      webview.add_ProcessFailed(&process_failed_handler, &mut token)?;
+    }
+
     // IPC handler
     unsafe { Self::attach_ipc_handler(&webview, &mut attributes, &mut token)? };
 
@@ -571,6 +620,12 @@ impl InnerWebView {
     if !is_child {
       unsafe { Self::attach_parent_subclass(parent, controller) };
     }
+
+    // Keep Windows Clipboard History (Win+V) working for copies made inside
+    // the WebView: WebView2 writes the clipboard from an internal window the
+    // history service ignores (MicrosoftEdge/WebView2Feedback#5650). The
+    // host window re-owns those writes; see webview2/clipboard_history.rs.
+    unsafe { clipboard_history::attach(parent) };
 
     unsafe {
       controller.SetIsVisible(attributes.visible)?;
@@ -1729,6 +1784,8 @@ impl InnerWebView {
       if !self.is_child {
         Self::dettach_parent_subclass(*self.parent.borrow());
         Self::attach_parent_subclass(parent, &self.controller);
+        clipboard_history::detach(*self.parent.borrow());
+        clipboard_history::attach(parent);
 
         *self.parent.borrow_mut() = parent;
 
@@ -1887,7 +1944,207 @@ pub fn platform_webview_version() -> Result<String> {
 
 fn configured_browser_executable_folder() -> Option<HSTRING> {
   let folder = std::env::var_os("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER");
-  browser_executable_folder_from(folder.as_deref(), cfg!(target_vendor = "win7"))
+  let version = windows_version::OsVersion::current();
+  let fixed_runtime_enabled = should_use_fixed_runtime(
+    cfg!(target_vendor = "win7"),
+    version.major,
+    version.minor,
+  );
+  // DBX patch: an explicitly configured fixed runtime (env var) wins on any
+  // Windows version. The startup compatibility ladder can point at a
+  // self-contained WebView2 runtime when the machine-wide Evergreen runtime is
+  // hooked by a security product; upstream wry only honored the variable on the
+  // Windows 7 target.
+  browser_executable_folder_from(folder.as_deref(), fixed_runtime_enabled || folder.is_some())
+}
+
+/// DBX patch: additional browser arguments supplied through the documented
+/// `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` environment variable.
+fn additional_browser_args_from_environment() -> Option<String> {
+  std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+    .ok()
+    .filter(|value| !value.trim().is_empty())
+}
+
+/// DBX patch: user data folder supplied through
+/// `WEBVIEW2_USER_DATA_FOLDER`, when non-empty.
+fn user_data_folder_from_environment() -> Option<HSTRING> {
+  std::env::var_os("WEBVIEW2_USER_DATA_FOLDER")
+    .filter(|value| !value.is_empty())
+    .map(HSTRING::from)
+}
+
+/// DBX patch: merges two Chromium command lines kept in single strings.
+///
+/// `--disable-features` / `--enable-features` switches replace each other in
+/// Chromium instead of accumulating, so both lists are unioned (base order
+/// first); every other switch is appended when not already present. Arguments
+/// containing embedded whitespace are not supported, which matches the fixed
+/// flag set DBX's startup compatibility ladder uses.
+fn merge_browser_arguments(base: &str, extra: &str) -> String {
+  use std::collections::BTreeMap;
+
+  let mut switches: Vec<String> = Vec::new();
+  let mut feature_lists: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+
+  for argument in base.split_whitespace().chain(extra.split_whitespace()) {
+    let (feature_kind, features) = if let Some(features) = argument.strip_prefix("--disable-features=") {
+      (Some("--disable-features"), features)
+    } else if let Some(features) = argument.strip_prefix("--enable-features=") {
+      (Some("--enable-features"), features)
+    } else {
+      (None, "")
+    };
+
+    match feature_kind {
+      Some(feature_kind) => {
+        let merged = feature_lists.entry(feature_kind).or_default();
+        for feature in features.split(',').map(str::trim).filter(|feature| !feature.is_empty()) {
+          if !merged.iter().any(|existing| existing == feature) {
+            merged.push(feature.to_string());
+          }
+        }
+      }
+      None => {
+        if !switches.iter().any(|existing| existing == argument) {
+          switches.push(argument.to_string());
+        }
+      }
+    }
+  }
+
+  for (feature_kind, features) in feature_lists {
+    if !features.is_empty() {
+      switches.push(format!("{feature_kind}={}", features.join(",")));
+    }
+  }
+
+  switches.join(" ")
+}
+
+/// Builds a structured [`WebView2ProcessFailedInfo`] from the WebView2 event
+/// args.
+///
+/// Kind is always present; reason / exit code / process description /
+/// affected frames only exist on the v2 event args (`ICoreWebView2ProcessFailedEventArgs2`).
+fn process_failed_info(args: &ICoreWebView2ProcessFailedEventArgs) -> WebView2ProcessFailedInfo {
+  let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+  let _ = unsafe { args.ProcessFailedKind(&mut kind) };
+  let mut info = WebView2ProcessFailedInfo {
+    kind: process_failed_kind(kind),
+    reason: None,
+    exit_code: None,
+    process_description: None,
+    affected_frames: 0,
+  };
+  if let Ok(args2) = args.cast::<ICoreWebView2ProcessFailedEventArgs2>() {
+    let mut reason = COREWEBVIEW2_PROCESS_FAILED_REASON::default();
+    let mut exit_code = 0i32;
+    let mut process = PWSTR::null();
+    let _ = unsafe { args2.Reason(&mut reason) };
+    let _ = unsafe { args2.ExitCode(&mut exit_code) };
+    let _ = unsafe { args2.ProcessDescription(&mut process) };
+    info.reason = Some(process_failed_reason_name(reason).to_string());
+    info.exit_code = Some(exit_code);
+    info.process_description = Some(take_pwstr(process));
+    if let Ok(collection) = unsafe { args2.FrameInfosForFailedProcess() } {
+      if let Ok(iterator) = unsafe { collection.GetIterator() } {
+        let mut has_current = BOOL::default();
+        while unsafe { iterator.HasCurrent(&mut has_current) }.is_ok() && has_current.as_bool() {
+          info.affected_frames += 1;
+          let _ = unsafe { iterator.MoveNext(&mut BOOL::default()) };
+        }
+      }
+    }
+  }
+  info
+}
+
+/// Maps a raw [`COREWEBVIEW2_PROCESS_FAILED_KIND`] to the public kind.
+fn process_failed_kind(kind: COREWEBVIEW2_PROCESS_FAILED_KIND) -> WebView2ProcessFailedKind {
+  match kind {
+    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED => WebView2ProcessFailedKind::Browser,
+    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED => WebView2ProcessFailedKind::Renderer,
+    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE => {
+      WebView2ProcessFailedKind::RendererUnresponsive
+    }
+    COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED => {
+      WebView2ProcessFailedKind::FrameRenderer
+    }
+    COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED => WebView2ProcessFailedKind::Gpu,
+    COREWEBVIEW2_PROCESS_FAILED_KIND_UTILITY_PROCESS_EXITED => WebView2ProcessFailedKind::Utility,
+    COREWEBVIEW2_PROCESS_FAILED_KIND_SANDBOX_HELPER_PROCESS_EXITED => {
+      WebView2ProcessFailedKind::SandboxHelper
+    }
+    COREWEBVIEW2_PROCESS_FAILED_KIND_PPAPI_PLUGIN_PROCESS_EXITED => {
+      WebView2ProcessFailedKind::PpapiPlugin
+    }
+    COREWEBVIEW2_PROCESS_FAILED_KIND_PPAPI_BROKER_PROCESS_EXITED => {
+      WebView2ProcessFailedKind::PpapiBroker
+    }
+    _ => WebView2ProcessFailedKind::Unknown,
+  }
+}
+
+/// Human-readable name for a [`WebView2ProcessFailedKind`].
+fn process_failed_kind_name(kind: WebView2ProcessFailedKind) -> &'static str {
+  match kind {
+    WebView2ProcessFailedKind::Browser => "browser",
+    WebView2ProcessFailedKind::Renderer => "renderer",
+    WebView2ProcessFailedKind::RendererUnresponsive => "renderer_unresponsive",
+    WebView2ProcessFailedKind::FrameRenderer => "frame_renderer",
+    WebView2ProcessFailedKind::Gpu => "gpu",
+    WebView2ProcessFailedKind::Utility => "utility",
+    WebView2ProcessFailedKind::SandboxHelper => "sandbox_helper",
+    WebView2ProcessFailedKind::PpapiPlugin => "ppapi_plugin",
+    WebView2ProcessFailedKind::PpapiBroker => "ppapi_broker",
+    WebView2ProcessFailedKind::Unknown => "unknown",
+  }
+}
+
+/// Human-readable name for a [`COREWEBVIEW2_PROCESS_FAILED_REASON`].
+fn process_failed_reason_name(reason: COREWEBVIEW2_PROCESS_FAILED_REASON) -> &'static str {
+  match reason {
+    COREWEBVIEW2_PROCESS_FAILED_REASON_UNEXPECTED => "unexpected",
+    COREWEBVIEW2_PROCESS_FAILED_REASON_UNRESPONSIVE => "unresponsive",
+    COREWEBVIEW2_PROCESS_FAILED_REASON_TERMINATED => "terminated",
+    COREWEBVIEW2_PROCESS_FAILED_REASON_CRASHED => "crashed",
+    COREWEBVIEW2_PROCESS_FAILED_REASON_LAUNCH_FAILED => "launch_failed",
+    COREWEBVIEW2_PROCESS_FAILED_REASON_OUT_OF_MEMORY => "out_of_memory",
+    COREWEBVIEW2_PROCESS_FAILED_REASON_PROFILE_DELETED => "profile_deleted",
+    _ => "unknown",
+  }
+}
+
+/// Returns the application-level ProcessFailed callback, if one was
+/// registered via [`crate::set_webview2_process_failed_callback`].
+fn webview2_process_failed_callback() -> Option<crate::WebView2ProcessFailedCallback> {
+  crate::WEBVIEW2_PROCESS_FAILED_CALLBACK
+    .read()
+    .ok()
+    .and_then(|callback| callback.clone())
+}
+
+/// Emits a diagnostic line for every ProcessFailed event.
+///
+/// issue t8y2/dbx#6362 only proves the WebView2 process group disappeared,
+/// not which event actually fired on the affected devices, so every event is
+/// recorded with its kind / reason / exit code / process description /
+/// affected-frame info. This is the forensics channel for confirming the real
+/// failure on Windows hardware.
+fn record_process_failure(info: &WebView2ProcessFailedInfo) {
+  let description = format!(
+    "webview2 process failed kind={} reason={} exit_code={} process={} frames={}",
+    process_failed_kind_name(info.kind),
+    info.reason.as_deref().unwrap_or("-"),
+    info.exit_code.map(|code| code.to_string()).unwrap_or_else(|| "-".into()),
+    info.process_description.as_deref().unwrap_or("-"),
+    info.affected_frames,
+  );
+  #[cfg(feature = "tracing")]
+  tracing::error!("{description}");
+  #[cfg(debug_assertions)]
+  eprintln!("{description}");
 }
 
 fn browser_executable_folder_from(
@@ -1908,6 +2165,21 @@ mod tests {
   use super::*;
 
   #[test]
+  fn win7_target_uses_fixed_runtime_on_windows_7() {
+    assert!(should_use_fixed_runtime(true, 6, 1));
+  }
+
+  #[test]
+  fn compatibility_target_uses_fixed_runtime_on_server_2012_r2() {
+    assert!(should_use_fixed_runtime(true, 6, 3));
+  }
+
+  #[test]
+  fn standard_windows_target_uses_system_runtime_on_windows_7() {
+    assert!(!should_use_fixed_runtime(false, 6, 1));
+  }
+
+  #[test]
   fn missing_or_empty_browser_folder_uses_system_runtime() {
     assert!(browser_executable_folder_from(None, true).is_none());
     assert!(browser_executable_folder_from(Some(OsStr::new("")), true).is_none());
@@ -1925,11 +2197,137 @@ mod tests {
 
     assert_eq!(value.to_string_lossy(), folder.to_string_lossy());
   }
+
+  #[test]
+  fn merge_browser_arguments_appends_environment_switches() {
+    let merged = merge_browser_arguments(
+      "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection",
+      "--no-sandbox --disable-gpu",
+    );
+    assert_eq!(
+      merged,
+      "--no-sandbox --disable-gpu --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"
+    );
+  }
+
+  #[test]
+  fn merge_browser_arguments_unions_feature_lists_instead_of_replacing_them() {
+    let merged = merge_browser_arguments(
+      "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-sandbox",
+      "--disable-features=RendererCodeIntegrity,msSmartScreenProtection --disable-gpu",
+    );
+    let arguments = merged.split(' ').collect::<Vec<_>>();
+    assert_eq!(
+      arguments.iter().filter(|argument| argument.starts_with("--disable-features=")).count(),
+      1
+    );
+    assert!(merged.contains("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,RendererCodeIntegrity"));
+    assert!(merged.contains("--no-sandbox"));
+    assert!(merged.contains("--disable-gpu"));
+  }
+
+  #[test]
+  fn merge_browser_arguments_deduplicates_identical_switches() {
+    let merged = merge_browser_arguments("--no-sandbox --disable-gpu", "--disable-gpu --no-sandbox");
+    assert_eq!(merged, "--no-sandbox --disable-gpu");
+  }
+
+  #[test]
+  fn merge_browser_arguments_keeps_enable_features_separate_from_disable_features() {
+    let merged = merge_browser_arguments("--enable-features=A", "--disable-features=B");
+    assert_eq!(merged, "--enable-features=A --disable-features=B");
+  }
+
+  #[test]
+  fn merge_browser_arguments_handles_empty_inputs() {
+    assert_eq!(merge_browser_arguments("--no-sandbox", "   "), "--no-sandbox");
+    assert_eq!(merge_browser_arguments("", "--no-sandbox"), "--no-sandbox");
+    assert_eq!(merge_browser_arguments("", ""), "");
+  }
+
+  #[test]
+  fn process_failed_kind_maps_all_raw_kinds() {
+    assert_eq!(
+      process_failed_kind(COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED),
+      WebView2ProcessFailedKind::Browser
+    );
+    assert_eq!(
+      process_failed_kind(COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED),
+      WebView2ProcessFailedKind::Renderer
+    );
+    assert_eq!(
+      process_failed_kind(COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE),
+      WebView2ProcessFailedKind::RendererUnresponsive
+    );
+    assert_eq!(
+      process_failed_kind(COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED),
+      WebView2ProcessFailedKind::FrameRenderer
+    );
+    assert_eq!(
+      process_failed_kind(COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED),
+      WebView2ProcessFailedKind::Gpu
+    );
+    assert_eq!(
+      process_failed_kind(COREWEBVIEW2_PROCESS_FAILED_KIND_UTILITY_PROCESS_EXITED),
+      WebView2ProcessFailedKind::Utility
+    );
+    assert_eq!(
+      process_failed_kind(COREWEBVIEW2_PROCESS_FAILED_KIND_SANDBOX_HELPER_PROCESS_EXITED),
+      WebView2ProcessFailedKind::SandboxHelper
+    );
+    assert_eq!(
+      process_failed_kind(COREWEBVIEW2_PROCESS_FAILED_KIND_PPAPI_PLUGIN_PROCESS_EXITED),
+      WebView2ProcessFailedKind::PpapiPlugin
+    );
+    assert_eq!(
+      process_failed_kind(COREWEBVIEW2_PROCESS_FAILED_KIND_PPAPI_BROKER_PROCESS_EXITED),
+      WebView2ProcessFailedKind::PpapiBroker
+    );
+    assert_eq!(
+      process_failed_kind(COREWEBVIEW2_PROCESS_FAILED_KIND_UNKNOWN_PROCESS_EXITED),
+      WebView2ProcessFailedKind::Unknown
+    );
+  }
+
+  #[test]
+  fn process_failed_kind_and_reason_names_are_stable() {
+    assert_eq!(
+      process_failed_kind_name(WebView2ProcessFailedKind::Browser),
+      "browser"
+    );
+    assert_eq!(
+      process_failed_kind_name(WebView2ProcessFailedKind::Renderer),
+      "renderer"
+    );
+    assert_eq!(
+      process_failed_kind_name(WebView2ProcessFailedKind::RendererUnresponsive),
+      "renderer_unresponsive"
+    );
+    assert_eq!(
+      process_failed_kind_name(WebView2ProcessFailedKind::FrameRenderer),
+      "frame_renderer"
+    );
+    assert_eq!(process_failed_kind_name(WebView2ProcessFailedKind::Gpu), "gpu");
+    assert_eq!(
+      process_failed_reason_name(COREWEBVIEW2_PROCESS_FAILED_REASON_CRASHED),
+      "crashed"
+    );
+    assert_eq!(
+      process_failed_reason_name(COREWEBVIEW2_PROCESS_FAILED_REASON_OUT_OF_MEMORY),
+      "out_of_memory"
+    );
+  }
 }
 
 #[inline]
 fn is_windows_7() -> bool {
   let v = windows_version::OsVersion::current();
-  // windows 7 is 6.1
+  // Windows 7 的内核版本是 6.1。
   v.major == 6 && v.minor == 1
+}
+
+fn should_use_fixed_runtime(is_win7_target: bool, os_major: u32, os_minor: u32) -> bool {
+  // Windows 7 与 Server 2012 R2 专用离线包都必须使用随包 Runtime，
+  // 避免旧系统依赖机器级 Evergreen 注册状态。
+  is_win7_target && os_major == 6 && matches!(os_minor, 1 | 3)
 }

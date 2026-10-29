@@ -1,13 +1,38 @@
 import type { BinaryHexViewRow } from "@/lib/dataGrid/binaryHexViewer";
 import { buildBinaryHexViewRows } from "@/lib/dataGrid/binaryHexViewer";
-import { formatJsonSource, parseJsonPreservingLargeNumbers } from "@/lib/common/safeJsonFormat";
+import { decodeJsonUnicodeEscapes, formatJsonSource, isLosslessJsonNumber, parseJsonPreservingLargeNumbers } from "@/lib/common/safeJsonFormat";
 import type { RedisBlob, RedisCollectionPage, RedisHashItem, RedisListItem, RedisSetItem, RedisValue, RedisZsetItem } from "@/lib/backend/api";
-import { parseJavaSerializedDetail, type RedisJavaSerializedDetail } from "@/lib/redis/javaSerialized";
+import { decodeMsgpack, decodePhpSerialized, decodePickle, isPickleMagic, parseJavaSerializedDetail, type RedisJavaSerializedDetail, type RedisMsgpackDetail, type RedisPhpSerializedDetail, type RedisPickleDetail } from "@/lib/redis/codec";
 
-export type RedisValueFormat = "utf8" | "ascii" | "binary" | "json" | "javaserialize" | "hex" | "base64" | "decompressed";
+export type RedisValueView = "utf8" | "ascii" | "binary" | "json" | "unicodejson" | "yaml" | "xml" | "hex" | "base64";
+export type RedisValueCodec = "none" | "gzip" | "zlib" | "deflate" | "base64" | "msgpack" | "pickle" | "phpserialize" | "protobuf" | "javaserialize";
+export type RedisValueFormat = RedisValueView;
 export type RedisMemberDetailFormat = "json" | "text";
 
-export const REDIS_VALUE_FORMAT_DISPLAY_ORDER: RedisValueFormat[] = ["utf8", "ascii", "binary", "json", "javaserialize", "hex", "base64", "decompressed"];
+export const REDIS_VALUE_VIEW_DISPLAY_ORDER: RedisValueView[] = ["utf8", "ascii", "binary", "json", "unicodejson", "yaml", "xml", "hex", "base64"];
+export const REDIS_VALUE_FORMAT_DISPLAY_ORDER: RedisValueFormat[] = REDIS_VALUE_VIEW_DISPLAY_ORDER;
+export const REDIS_VALUE_CODEC_ORDER: RedisValueCodec[] = ["none", "gzip", "zlib", "deflate", "base64", "msgpack", "pickle", "phpserialize", "javaserialize", "protobuf"];
+
+export function isRedisValueView(value: string | null | undefined): value is RedisValueView {
+  return value === "utf8" || value === "ascii" || value === "binary" || value === "json" || value === "unicodejson" || value === "yaml" || value === "xml" || value === "hex" || value === "base64";
+}
+
+export function isRedisValueCodec(value: string | null | undefined): value is RedisValueCodec {
+  return value === "none" || value === "gzip" || value === "zlib" || value === "deflate" || value === "base64" || value === "msgpack" || value === "pickle" || value === "phpserialize" || value === "protobuf" || value === "javaserialize";
+}
+
+export function isDecompressCodec(codec: RedisValueCodec): codec is "gzip" | "zlib" | "deflate" {
+  return codec === "gzip" || codec === "zlib" || codec === "deflate";
+}
+
+/** Views that render a JSON-able value instead of the raw bytes. */
+export function isJsonDerivedView(view: RedisValueView): boolean {
+  return view === "json" || view === "unicodejson" || view === "yaml" || view === "xml";
+}
+
+export function isStructuredCodec(codec: RedisValueCodec): boolean {
+  return codec === "pickle" || codec === "msgpack" || codec === "phpserialize" || codec === "protobuf" || codec === "javaserialize";
+}
 
 export interface RedisMemberDetail {
   text: string;
@@ -19,8 +44,13 @@ export interface RedisMemberDetail {
   format: RedisMemberDetailFormat;
   json?: RedisJsonDetail;
   javaSerialized?: RedisJavaSerializedDetail;
+  pickle?: RedisPickleDetail;
+  msgpack?: RedisMsgpackDetail;
+  phpSerialized?: RedisPhpSerializedDetail;
   availableFormats: RedisValueFormat[];
   defaultFormat: RedisValueFormat;
+  availableCodecs: RedisValueCodec[];
+  defaultCodec: RedisValueCodec;
   byteCount: number;
   base64Text: string;
   hexRows: BinaryHexViewRow[];
@@ -32,6 +62,7 @@ export interface RedisJsonDetail {
   rawText: string;
   formattedText: string;
   value: unknown;
+  serializedLevel?: number;
 }
 
 export type RedisJsonDraftNormalizationResult =
@@ -92,7 +123,9 @@ export function formatRedisMemberDetail(value: unknown, options: RedisMemberDeta
   if (typeof value === "string") {
     const bytes = new TextEncoder().encode(value);
     const json = options.allowJsonText ? (parseRedisJsonDetail(value) ?? undefined) : undefined;
+    const extra = detectStructuredCodecs(bytes);
     const textFormats: RedisValueFormat[] = ["utf8", "ascii", "binary"];
+    const extraFormats: RedisValueFormat[] = json ? JSON_DERIVED_FORMATS : [];
     return {
       text: sanitizeRedisDisplayText(value),
       rawText: value,
@@ -102,8 +135,14 @@ export function formatRedisMemberDetail(value: unknown, options: RedisMemberDeta
       binaryText: binaryBytesToText(bytes),
       format: "text",
       json,
-      availableFormats: formatOrderForValue("utf8", textFormats, json ? ["json"] : []),
+      javaSerialized: extra.javaSerialized,
+      pickle: extra.pickle,
+      msgpack: extra.msgpack,
+      phpSerialized: extra.phpSerialized,
+      availableFormats: formatOrderForValue("utf8", textFormats, extraFormats),
       defaultFormat: "utf8",
+      availableCodecs: REDIS_VALUE_CODEC_ORDER,
+      defaultCodec: extra.defaultCodec,
       byteCount: bytes.byteLength,
       base64Text: bytesToBase64(bytes),
       hexRows: buildBinaryHexViewRows(bytes),
@@ -124,8 +163,10 @@ export function formatRedisMemberDetail(value: unknown, options: RedisMemberDeta
       binaryText: binaryBytesToText(bytes),
       format: "json",
       json: { rawText: formattedText, formattedText, value },
-      availableFormats: formatOrderForValue("json", ["utf8"], ["json"]),
+      availableFormats: formatOrderForValue("json", ["utf8"], JSON_DERIVED_FORMATS),
       defaultFormat: "json",
+      availableCodecs: ["none"],
+      defaultCodec: "none",
       byteCount: bytes.byteLength,
       base64Text: bytesToBase64(bytes),
       hexRows: buildBinaryHexViewRows(bytes),
@@ -145,6 +186,8 @@ export function formatRedisMemberDetail(value: unknown, options: RedisMemberDeta
       format: "text",
       availableFormats: formatOrderForValue("utf8", ["utf8"], []),
       defaultFormat: "utf8",
+      availableCodecs: ["none"],
+      defaultCodec: "none",
       byteCount: bytes.byteLength,
       base64Text: bytesToBase64(bytes),
       hexRows: buildBinaryHexViewRows(bytes),
@@ -165,6 +208,24 @@ export function formatRedisCommandResult(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
+export type RedisCommandResultPairKind = "field-value" | "member-score";
+
+const REDIS_KEY_VALUE_COMMANDS = new Set(["HGETALL"]);
+// Sorted-set commands whose WITHSCORES modifier returns member/score pairs.
+const REDIS_WITHSCORES_COMMANDS = new Set(["ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZRANDMEMBER", "ZDIFF", "ZINTER", "ZUNION"]);
+const REDIS_WITHSCORES_MODIFIER = /\bWITHSCORES\b/i;
+
+function redisCommandHead(command: string | undefined): string {
+  return command?.trim().split(/\s+/, 1)[0]?.toUpperCase() ?? "";
+}
+
+export function redisCommandResultPairKind(command: string | undefined): RedisCommandResultPairKind | undefined {
+  const head = redisCommandHead(command);
+  if (REDIS_KEY_VALUE_COMMANDS.has(head)) return "field-value";
+  if (REDIS_WITHSCORES_COMMANDS.has(head) && command && REDIS_WITHSCORES_MODIFIER.test(command)) return "member-score";
+  return undefined;
+}
+
 /** RedisJSON source text stays out of JavaScript's numeric representation. */
 export function redisJsonValueText(value: { value: string }): string {
   return value.value;
@@ -180,6 +241,84 @@ function isRedisClusterInfoValue(value: unknown): value is [string, string][] {
   return Array.isArray(value) && value.length > 0 && (value as unknown[]).every((item) => Array.isArray(item) && item.length === 2 && typeof item[0] === "string" && typeof item[1] === "string" && item[1].startsWith("# "));
 }
 
+interface RedisMapEntry {
+  key: unknown;
+  value: unknown;
+}
+
+function isRedisMapEntry(value: unknown): value is RedisMapEntry {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, "key") && Object.prototype.hasOwnProperty.call(value, "value");
+}
+
+function isRedisPair(value: unknown): value is [unknown, unknown] {
+  return Array.isArray(value) && value.length === 2;
+}
+
+function quoteRedisString(value: string): string {
+  return JSON.stringify(formatRedisStringValue(value)) ?? '""';
+}
+
+function formatRedisConsoleScalar(value: unknown, nested: boolean): string {
+  if (value == null) return "(nil)";
+  if (typeof value === "string") {
+    const text = formatRedisStringValue(value);
+    if (nested) return quoteRedisString(value);
+    return text.length > 0 ? text : '""';
+  }
+  if (typeof value === "number") return Number.isInteger(value) ? `(integer) ${value}` : `(double) ${value}`;
+  if (typeof value === "bigint") return `(integer) ${value}`;
+  if (typeof value === "boolean") return value ? "(true)" : "(false)";
+  return String(value);
+}
+
+function prefixRedisConsoleLines(prefix: string, lines: string[]): string[] {
+  if (lines.length === 0) return [prefix.trimEnd()];
+  const padding = " ".repeat(prefix.length);
+  return [`${prefix}${lines[0]}`, ...lines.slice(1).map((line) => `${padding}${line}`)];
+}
+
+function formatRedisConsoleInline(value: unknown): string {
+  if (typeof value === "string") return quoteRedisString(value);
+  if (value == null || typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return formatRedisConsoleScalar(value, true);
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function redisConsolePairs(value: unknown[], command: string | undefined): Array<[unknown, unknown]> | undefined {
+  if (value.length > 0 && value.every(isRedisMapEntry)) return (value as RedisMapEntry[]).map((entry): [unknown, unknown] => [entry.key, entry.value]);
+  if (!redisCommandResultPairKind(command)) return undefined;
+  if (value.length > 0 && value.every(isRedisPair)) return (value as Array<[unknown, unknown]>).map((entry): [unknown, unknown] => [entry[0], entry[1]]);
+  if (value.length % 2 !== 0) return undefined;
+  const pairs: Array<[unknown, unknown]> = [];
+  for (let index = 0; index < value.length; index += 2) pairs.push([value[index], value[index + 1]]);
+  return pairs;
+}
+
+function formatRedisConsolePairs(pairs: Array<[unknown, unknown]>): string[] {
+  if (pairs.length === 0) return ["(empty array)"];
+  return pairs.flatMap(([key, value], index) => prefixRedisConsoleLines(`${index + 1}) ${formatRedisConsoleInline(key)} => `, formatRedisConsoleLines(value, undefined, true)));
+}
+
+function formatRedisConsoleLines(value: unknown, command: string | undefined, nested: boolean): string[] {
+  if (Array.isArray(value)) {
+    if (value.length === 0) return ["(empty array)"];
+    const pairs = redisConsolePairs(value, command);
+    if (pairs) return formatRedisConsolePairs(pairs);
+    return value.flatMap((entry, index) => prefixRedisConsoleLines(`${index + 1}) `, formatRedisConsoleLines(entry, undefined, true)));
+  }
+  if (typeof value === "object" && value !== null) {
+    try {
+      return (JSON.stringify(value, null, 2) ?? String(value)).split("\n");
+    } catch {
+      return [String(value)];
+    }
+  }
+  return [formatRedisConsoleScalar(value, nested)];
+}
+
 /**
  * Format a Redis command result for the **command console terminal** (RedisKeyBrowser.vue).
  * Unlike `formatRedisCommandResult` (used by the query result table UI), this function
@@ -188,14 +327,21 @@ function isRedisClusterInfoValue(value: unknown): value is [string, string][] {
  *
  * - Cluster INFO `[[addr, infoText], ...]` → `"{addr}\n{infoText}"` per node, joined by newlines.
  * - Plain string → passthrough (handles single-node INFO text correctly).
- * - Everything else → JSON.stringify (arrays, objects, etc.).
+ * - Arrays use redis-cli-style numbered items, including nested arrays.
+ * - RESP3 maps plus HGETALL/WITHSCORES responses use readable key/value pairs.
+ * - Integers, doubles, booleans and nil retain visible Redis-style type markers.
  */
-export function formatRedisConsoleValue(value: unknown): string {
+export function formatRedisConsoleValue(value: unknown, command?: string): string {
   if (isRedisClusterInfoValue(value)) {
     return value.map(([addr, info]) => `${addr}\n${info}`).join("\n");
   }
-  if (typeof value === "string") return formatRedisStringValue(value);
-  return JSON.stringify(value, null, 2);
+  return formatRedisConsoleLines(value, command, false).join("\n");
+}
+
+export function formatRedisConsoleError(message: unknown): string {
+  const text = formatRedisStringValue(message).trim();
+  if (/^\(error\)(?:\s|$)/i.test(text)) return text;
+  return `(error) ${text || "Unknown Redis error"}`;
 }
 
 export function parseRedisJsonDetail(value: unknown): RedisJsonDetail | null {
@@ -206,12 +352,40 @@ export function parseRedisJsonDetail(value: unknown): RedisJsonDetail | null {
   try {
     // Pretty-print from source tokens so duplicate members and number spellings
     // stay intact when Redis string/hash values open in the JSON editor.
-    const formattedText = formatJsonSource(trimmed, 2);
-    const parsed = parseJsonPreservingLargeNumbers(trimmed);
+    let formattedText = formatJsonSource(trimmed, 2);
+    let parsed = parseJsonPreservingLargeNumbers(trimmed);
+    let serializedLevel = 0;
+
+    // Issue #11636: Support serialized JSON strings (e.g. "\"{\\\"abc\\\":\\\"\\\"}\"")
+    // produced by object mappers / serializers. Unwrap into a structured JSON container
+    // so it formats as an expandable object/array tree rather than an escaped scalar.
+    while (typeof parsed === "string") {
+      const innerTrimmed = parsed.trim();
+      if (!innerTrimmed.startsWith("{") && !innerTrimmed.startsWith("[") && !innerTrimmed.startsWith('"')) {
+        break;
+      }
+      try {
+        const nextFormatted = formatJsonSource(innerTrimmed, 2);
+        const nextParsed = parseJsonPreservingLargeNumbers(innerTrimmed);
+        if (typeof nextParsed === "string") {
+          const nextTrimmed = nextParsed.trim();
+          if (!nextTrimmed.startsWith("{") && !nextTrimmed.startsWith("[")) {
+            break;
+          }
+        }
+        formattedText = nextFormatted;
+        parsed = nextParsed;
+        serializedLevel += 1;
+      } catch {
+        break;
+      }
+    }
+
     return {
       rawText: value,
       formattedText,
       value: parsed,
+      ...(serializedLevel > 0 ? { serializedLevel } : {}),
     };
   } catch {
     return null;
@@ -221,14 +395,98 @@ export function parseRedisJsonDetail(value: unknown): RedisJsonDetail | null {
 /**
  * Validates a JSON editor draft and produces the compact text Redis should
  * store. Source-preserving minification keeps high-precision numbers and
- * duplicate object members intact.
+ * duplicate object members intact. When serializedLevel > 0 (issue #11636),
+ * wraps the compact text back into the expected serialized string representation.
  */
-export function normalizeRedisJsonDraft(text: string): RedisJsonDraftNormalizationResult {
+export function normalizeRedisJsonDraft(text: string, serializedLevel = 0): RedisJsonDraftNormalizationResult {
   try {
-    return { ok: true, compactText: formatJsonSource(text) };
+    let compactText = formatJsonSource(text);
+    for (let i = 0; i < serializedLevel; i += 1) {
+      compactText = JSON.stringify(compactText);
+    }
+    return { ok: true, compactText };
   } catch {
     return { ok: false, error: "invalid_json" };
   }
+}
+
+const JSON_DERIVED_FORMATS: RedisValueFormat[] = ["json", "unicodejson", "yaml", "xml"];
+
+export function unicodeRedisJsonText(json: RedisJsonDetail): string {
+  return decodeJsonUnicodeEscapes(json.formattedText);
+}
+
+export function jsonToYamlText(value: unknown): string {
+  return `${toYamlLines(value, 0).join("\n")}\n`;
+}
+
+export function jsonToXmlText(value: unknown): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>\n${toXmlNodes(value, "root", 0)}`;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function yamlScalar(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number" || typeof value === "bigint") return String(value);
+  // Lossless JSON numbers keep their raw spelling instead of becoming strings.
+  if (isLosslessJsonNumber(value)) return String(value.raw);
+  const text = String(value);
+  // Quote strings YAML would otherwise reinterpret as scalars of another type.
+  if (text === "" || /^(?:null|true|false|~|-?\d)/i.test(text) || /[:#{}[\],&*?|>'"%@`]/.test(text) || /\s/.test(text)) return JSON.stringify(text);
+  return text;
+}
+
+function toYamlLines(value: unknown, indent: number): string[] {
+  const pad = "  ".repeat(indent);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return [`${pad}[]`];
+    return value.flatMap((item) => {
+      if (isPlainObject(item) || Array.isArray(item)) {
+        const nested = toYamlLines(item, indent + 1);
+        return [`${pad}- ${nested[0].trimStart()}`, ...nested.slice(1)];
+      }
+      return [`${pad}- ${yamlScalar(item)}`];
+    });
+  }
+  if (isPlainObject(value)) {
+    const entries = Object.entries(value);
+    if (entries.length === 0) return [`${pad}{}`];
+    return entries.flatMap(([key, item]) => {
+      const isEmptyContainer = (isPlainObject(item) && Object.keys(item).length === 0) || (Array.isArray(item) && item.length === 0);
+      if (isEmptyContainer) return [`${pad}${yamlScalar(key)}: ${Array.isArray(item) ? "[]" : "{}"}`];
+      if (isPlainObject(item) || Array.isArray(item)) return [`${pad}${yamlScalar(key)}:`, ...toYamlLines(item, indent + 1)];
+      return [`${pad}${yamlScalar(key)}: ${yamlScalar(item)}`];
+    });
+  }
+  return [`${pad}${yamlScalar(value)}`];
+}
+
+function xmlEscape(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function xmlTag(name: string): string {
+  const tag = name.replace(/[^\w.-]/g, "_");
+  if (!tag) return "item";
+  return /^-|\./.test(tag) || /^\d/.test(tag) ? `_${tag}` : tag;
+}
+
+function toXmlNodes(value: unknown, name: string, indent: number): string {
+  const pad = "  ".repeat(indent);
+  const tag = xmlTag(name);
+  if (Array.isArray(value)) return value.map((item) => toXmlNodes(item, tag === "root" ? "item" : tag, indent)).join("\n");
+  if (isPlainObject(value)) {
+    const inner = Object.entries(value)
+      .map(([key, item]) => toXmlNodes(item, key, indent + 1))
+      .join("\n");
+    return `${pad}<${tag}>\n${inner}\n${pad}</${tag}>`;
+  }
+  const text = value === null ? "" : xmlEscape(isLosslessJsonNumber(value) ? String(value.raw) : String(value));
+  return `${pad}<${tag}>${text}</${tag}>`;
 }
 
 export function preferredRedisValueFormat(value: unknown, preferred?: RedisValueFormat | null, options: RedisMemberDetailOptions = {}): RedisValueFormat {
@@ -237,20 +495,74 @@ export function preferredRedisValueFormat(value: unknown, preferred?: RedisValue
   return detail.defaultFormat;
 }
 
+/**
+ * Issue #10922: a string payload that parses into a JSON object or array opens
+ * pretty-printed instead of raw, matching RedisInsight. `stored` is the
+ * persisted format preference; null means the user never pinned a format, so
+ * detection wins. Scalar JSON ("123", "\"text\"") renders identically in both
+ * views, so it never triggers the switch.
+ */
+export function autoRedisValueFormat(detail: RedisMemberDetail, stored: RedisValueFormat | null): RedisValueFormat {
+  if (stored != null && shouldReuseRedisValueFormatPreference(detail, stored)) return stored;
+  if (stored == null && isRedisJsonContainerValue(detail.json?.value)) return "json";
+  return detail.defaultFormat;
+}
+
+export function isRedisJsonContainerValue(value: unknown): boolean {
+  return typeof value === "object" && value !== null;
+}
+
+/**
+ * Codec that `formatRedisMemberDetail` already decoded for this payload, or
+ * null. Java serialization, Pickle, and PHP serialization have deterministic
+ * magic prefixes; Protobuf is deliberately excluded because without a schema
+ * its wire format matches too many byte strings. Msgpack has no magic prefix
+ * -- any single byte is a valid msgpack scalar -- so its detection
+ * additionally requires the decoded value to be a container, matching the
+ * JSON auto-format guard above.
+ */
+export function detectedRedisStructuredCodec(detail: RedisMemberDetail): RedisValueCodec | null {
+  if (detail.javaSerialized) return "javaserialize";
+  if (detail.pickle) return "pickle";
+  if (detail.msgpack && isRedisJsonContainerValue(detail.msgpack.value)) return "msgpack";
+  if (detail.phpSerialized) return "phpserialize";
+  return null;
+}
+
 export function canRenderRedisValueFormat(detail: RedisMemberDetail, format: RedisValueFormat): boolean {
-  switch (format) {
-    case "json":
-      return Boolean(detail.json);
-    case "javaserialize":
-      return Boolean(detail.javaSerialized);
-    default:
-      return true;
-  }
+  return !isJsonDerivedView(format) || Boolean(detail.json);
+}
+
+export function canRenderRedisValueView(detail: RedisMemberDetail, view: RedisValueView): boolean {
+  return !isJsonDerivedView(view) || Boolean(detail.json);
+}
+
+export function preferredRedisValueView(value: unknown, preferred?: RedisValueView | null, options: RedisMemberDetailOptions = {}): RedisValueView {
+  const format = preferredRedisValueFormat(value, preferred, options);
+  return isRedisValueView(format) ? format : "utf8";
+}
+
+export function preferredRedisValueCodec(detail: RedisMemberDetail, preferred?: RedisValueCodec | null): RedisValueCodec {
+  if (preferred && preferred !== "none" && detail.availableCodecs.includes(preferred)) return preferred;
+  return "none";
 }
 
 export function redisMemberCopyText(value: unknown): string {
   const text = isRedisBlob(value) ? redisBlobRawText(value) : formatRedisMemberDetail(value).rawText;
   return redisClipboardSafeText(text);
+}
+
+/** Copy targets for one hash row: its field, its value, or both. */
+export type RedisHashRowCopyTarget = "field" | "value" | "fieldValue";
+
+/**
+ * Copy text for one hash row. `fieldValue` joins the two with a tab so the
+ * result pastes into a spreadsheet as two columns, matching the grid's TSV copy.
+ */
+export function redisHashRowCopyText(field: unknown, value: unknown, target: RedisHashRowCopyTarget): string {
+  if (target === "value") return redisMemberCopyText(value);
+  const fieldText = redisMemberCopyText(field);
+  return target === "field" ? fieldText : `${fieldText}\t${redisMemberCopyText(value)}`;
 }
 
 export function redisClipboardSafeText(value: string): string {
@@ -318,7 +630,9 @@ export function redisValueCollectionScanCursor(value: RedisValue): number | unde
 export function redisValueSize(value: RedisValue): number {
   switch (value.data.kind) {
     case "string":
-      return decodeRedisBlob(value.data.content).byteLength;
+    // kvrocks 位图与字符串一样按字节计长度
+    case "bitmap":
+      return value.data.total_bytes ?? decodeRedisBlob(value.data.content).byteLength;
     case "json":
       return new TextEncoder().encode(redisJsonValueText(value.data)).byteLength;
     case "list":
@@ -336,6 +650,9 @@ export function redisValueSize(value: RedisValue): number {
 export function redisValuePreview(value: RedisValue): string {
   switch (value.data.kind) {
     case "string":
+      return previewText(redisBlobRawText(value.data.content));
+    case "bitmap":
+      // kvrocks 位图的 GET 结果就是字节内容，预览方式与字符串一致
       return previewText(redisBlobRawText(value.data.content));
     case "json":
       return previewText(redisJsonValueText(value.data));
@@ -458,13 +775,11 @@ function formatRedisBlobDetail(blob: RedisBlob, options: RedisMemberDetailOption
   const asciiText = asciiBytesToText(bytes);
   const binaryText = binaryBytesToText(bytes);
   const rawText = strictUtf8Text ?? binaryText;
-  const javaSerialized = parseJavaSerializedDetail(bytes);
-  const defaultFormat: RedisValueFormat = javaSerialized ? "javaserialize" : strictUtf8Text != null ? "utf8" : "hex";
+  const extra = detectStructuredCodecs(bytes);
+  const defaultFormat: RedisValueFormat = strictUtf8Text != null ? "utf8" : "hex";
   const json = options.allowJsonText && strictUtf8Text != null ? (parseRedisJsonDetail(strictUtf8Text) ?? undefined) : undefined;
   const textFormats: RedisValueFormat[] = strictUtf8Text != null ? ["utf8", "ascii", "binary"] : ["binary"];
-  const extraFormats: RedisValueFormat[] = [];
-  if (json) extraFormats.push("json");
-  if (javaSerialized) extraFormats.push("javaserialize");
+  const extraFormats: RedisValueFormat[] = json ? JSON_DERIVED_FORMATS : [];
   return {
     text: redisBlobDisplayText(blob),
     rawText,
@@ -474,9 +789,14 @@ function formatRedisBlobDetail(blob: RedisBlob, options: RedisMemberDetailOption
     binaryText,
     format: "text",
     json,
-    javaSerialized: javaSerialized ?? undefined,
+    javaSerialized: extra.javaSerialized,
+    pickle: extra.pickle,
+    msgpack: extra.msgpack,
+    phpSerialized: extra.phpSerialized,
     availableFormats: formatOrderForValue(defaultFormat, textFormats, extraFormats),
     defaultFormat,
+    availableCodecs: REDIS_VALUE_CODEC_ORDER,
+    defaultCodec: extra.defaultCodec,
     byteCount: bytes.byteLength,
     base64Text: blob.raw_base64,
     hexRows: buildBinaryHexViewRows(bytes),
@@ -490,10 +810,26 @@ function formatRedisJsonString(value: string): string | null {
 }
 
 function formatOrderForValue(defaultFormat: RedisValueFormat, textFormats: RedisValueFormat[], extraFormats: RedisValueFormat[]): RedisValueFormat[] {
-  const availableFormats: RedisValueFormat[] = [...textFormats];
-  availableFormats.push(...extraFormats);
-  availableFormats.push("hex", "base64");
+  const availableFormats: RedisValueFormat[] = [...textFormats, ...extraFormats, "hex", "base64"];
   return [defaultFormat, ...availableFormats.filter((format) => format !== defaultFormat)];
+}
+
+type DetectedCodecs = {
+  javaSerialized?: RedisJavaSerializedDetail;
+  pickle?: RedisPickleDetail;
+  msgpack?: RedisMsgpackDetail;
+  phpSerialized?: RedisPhpSerializedDetail;
+  defaultCodec: RedisValueCodec;
+};
+
+function detectStructuredCodecs(bytes: Uint8Array): DetectedCodecs {
+  const javaSerialized = parseJavaSerializedDetail(bytes) ?? undefined;
+  const pickle = javaSerialized || !isPickleMagic(bytes) ? undefined : (decodePickle(bytes) ?? undefined);
+  const msgpack = javaSerialized || pickle ? undefined : (decodeMsgpack(bytes) ?? undefined);
+  // Protobuf is deliberately absent: without a schema the wire format matches
+  // too many arbitrary byte strings, so it only decodes on explicit selection.
+  const phpSerialized = javaSerialized || pickle || msgpack ? undefined : (decodePhpSerialized(bytes) ?? undefined);
+  return { javaSerialized, pickle, msgpack, phpSerialized, defaultCodec: "none" };
 }
 
 function shouldReuseRedisValueFormatPreference(detail: RedisMemberDetail, format: RedisValueFormat): boolean {

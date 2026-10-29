@@ -1,14 +1,26 @@
 import type { QueryResult } from "@/types/database";
-import { formatRedisCommandResult } from "@/lib/redis/redisValuePresentation";
+import { formatRedisCommandResult, formatRedisConsoleError, formatRedisConsoleValue, redisCommandResultPairKind } from "@/lib/redis/redisValuePresentation";
 
-const KEY_VALUE_COMMANDS = new Set(["HGETALL"]);
+export interface RedisQueryConsoleEntry {
+  command: string;
+  output: string;
+  error: boolean;
+}
 
-function isKeyValueCommand(command: string): boolean {
-  return KEY_VALUE_COMMANDS.has(command.toUpperCase().trim());
+export function redisQueryResultsToConsoleEntries(results: readonly QueryResult[]): RedisQueryConsoleEntry[] {
+  return results.flatMap((result) => {
+    const error = result.execution_error === true;
+    const output = error ? formatRedisConsoleError(result.rows[0]?.[0]) : result.redis_console_output;
+    if (output === undefined) return [];
+    return [{ command: result.sourceStatement?.trim() ?? "", output, error }];
+  });
 }
 
 export function redisCommandResultToQueryResult(value: unknown, elapsedMs: number, command?: string): QueryResult {
-  if (Array.isArray(value) && command && isKeyValueCommand(command)) {
+  const execution_time_ms = Math.max(0, Math.round(elapsedMs));
+  const redis_console_output = formatRedisConsoleValue(value, command);
+  const pairKind = redisCommandResultPairKind(command);
+  if (Array.isArray(value) && pairKind === "field-value") {
     const rows: (string | number | boolean | null)[][] = [];
     for (let i = 0; i + 1 < value.length; i += 2) {
       rows.push([formatRedisCommandResult(value[i]), formatRedisCommandResult(value[i + 1])]);
@@ -17,7 +29,21 @@ export function redisCommandResultToQueryResult(value: unknown, elapsedMs: numbe
       columns: ["field", "value"],
       rows,
       affected_rows: value.length / 2,
-      execution_time_ms: Math.max(0, Math.round(elapsedMs)),
+      execution_time_ms,
+      redis_console_output,
+    };
+  }
+  if (Array.isArray(value) && pairKind === "member-score") {
+    const rows: (string | number | boolean | null)[][] = [];
+    for (let i = 0; i + 1 < value.length; i += 2) {
+      rows.push([formatRedisCommandResult(value[i]), formatRedisCommandResult(value[i + 1])]);
+    }
+    return {
+      columns: ["member", "score"],
+      rows,
+      affected_rows: rows.length,
+      execution_time_ms,
+      redis_console_output,
     };
   }
   // INFO commands in cluster mode → [[node_addr, info_text], ...] pairs.
@@ -28,7 +54,8 @@ export function redisCommandResultToQueryResult(value: unknown, elapsedMs: numbe
       columns: ["(index)", "value"],
       rows,
       affected_rows: value.length,
-      execution_time_ms: Math.max(0, Math.round(elapsedMs)),
+      execution_time_ms,
+      redis_console_output,
     };
   }
   if (Array.isArray(value)) {
@@ -37,13 +64,15 @@ export function redisCommandResultToQueryResult(value: unknown, elapsedMs: numbe
       columns: ["(index)", "value"],
       rows,
       affected_rows: value.length,
-      execution_time_ms: Math.max(0, Math.round(elapsedMs)),
+      execution_time_ms,
+      redis_console_output,
     };
   }
   return {
     columns: ["result"],
     rows: [[formatRedisCommandResult(value)]],
     affected_rows: 0,
-    execution_time_ms: Math.max(0, Math.round(elapsedMs)),
+    execution_time_ms,
+    redis_console_output,
   };
 }

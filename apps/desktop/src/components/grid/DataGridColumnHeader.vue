@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { CSSProperties, HTMLAttributes } from "vue";
-import { Copy, KeyRound, Hash } from "@lucide/vue";
+import { Copy, KeyRound, Hash, Highlighter } from "@lucide/vue";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { columnIndexColorClass, type ColumnIndexKind } from "@/lib/dataGrid/dataGridColumnIndexIcon";
 
@@ -25,6 +25,8 @@ const props = defineProps<{
   dragClass?: HTMLAttributes["class"];
   columnStyle?: CSSProperties;
   copyColumnNameLabel: string;
+  /** 与 nullableLabel 等同属「按条件渲染」的文案，未传时按钮 title 为空。 */
+  copyColumnCommentLabel?: string;
   columnNameLabel: string;
   columnTypeLabel: string;
   columnCommentLabel: string;
@@ -37,6 +39,12 @@ const props = defineProps<{
   columnRegularIndexLabel: string;
   /** 该列的索引类型，undefined 时不显示标识 */
   columnIndexKind?: ColumnIndexKind;
+  /** 该列当前展示值应用了格式化规则。 */
+  formatterActive?: boolean;
+  formatterLabel?: string;
+  /** 该列当前启用了重复值或空值高亮。 */
+  highlightActive?: boolean;
+  highlightLabel?: string;
 }>();
 
 function columnIndexText(kind: ColumnIndexKind): string {
@@ -54,6 +62,7 @@ const emit = defineEmits<{
   resizeStart: [event: MouseEvent];
   autoFit: [];
   copyName: [];
+  copyComment: [];
 }>();
 </script>
 
@@ -73,37 +82,44 @@ const emit = defineEmits<{
       <!-- 索引标识：显示在列名左侧 -->
       <KeyRound v-if="columnIndexKind === 'primary'" class="h-3 w-3 shrink-0" :class="columnIndexColorClass(columnIndexKind)" :title="columnIndexText(columnIndexKind)" />
       <Hash v-else-if="columnIndexKind && columnIndexKind !== 'none'" class="h-3 w-3 shrink-0" :class="columnIndexColorClass(columnIndexKind)" :title="columnIndexText(columnIndexKind)" />
-      <LightTooltip :text="name" side="bottom" :side-offset="4" :disabled="tooltipDisabled">
+      <LightTooltip :text="name" side="bottom" :side-offset="4" :disabled="tooltipDisabled" surface="popover" content-class="border border-border shadow-md">
         <span data-column-tooltip-trigger class="flex min-w-0 flex-1 flex-col overflow-hidden">
-          <span class="min-w-0 truncate leading-4">{{ name }}</span>
+          <span class="flex min-w-0 items-center gap-1 leading-4">
+            <span class="min-w-0 truncate">{{ name }}</span>
+          </span>
           <span v-if="showTypeLine" data-grid-header-type-line class="h-3 min-w-0 truncate text-[10px] font-normal leading-3" :class="[typeClass, { invisible: !columnType }]" :title="columnType || undefined" :aria-hidden="columnType ? undefined : true">{{ columnType }}</span>
           <span v-if="showCommentLine" data-grid-header-comment-line class="h-3 min-w-0 truncate text-[10px] font-normal leading-3 text-muted-foreground" :class="{ invisible: !columnComment }" :title="columnComment || undefined" :aria-hidden="columnComment ? undefined : true">{{
             columnComment
           }}</span>
         </span>
         <template #content>
-          <div class="grid min-w-56 grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1 px-3 py-2">
-            <span class="text-background/70">{{ columnNameLabel }}</span>
+          <div class="dbx-column-info-tooltip grid min-w-56 grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1 px-3 py-2">
+            <span class="text-muted-foreground">{{ columnNameLabel }}</span>
             <span class="flex min-w-0 items-center gap-2">
               <span class="min-w-0 flex-1 truncate font-mono">{{ name }}</span>
-              <button type="button" class="flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-background/10" :title="copyColumnNameLabel" @click.stop="emit('copyName')">
+              <button data-column-header-copy-name type="button" class="flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-accent hover:text-accent-foreground" :title="copyColumnNameLabel" @click.stop="emit('copyName')">
                 <Copy class="h-3 w-3" />
               </button>
             </span>
             <template v-if="tooltipColumnType ?? columnType">
-              <span class="text-background/70">{{ columnTypeLabel }}</span>
+              <span class="text-muted-foreground">{{ columnTypeLabel }}</span>
               <span :class="typeClass">{{ tooltipColumnType ?? columnType }}</span>
             </template>
             <template v-if="tooltipColumnComment ?? columnComment">
-              <span class="text-background/70">{{ columnCommentLabel }}</span>
-              <span>{{ tooltipColumnComment ?? columnComment }}</span>
+              <span class="text-muted-foreground">{{ columnCommentLabel }}</span>
+              <span class="flex min-w-0 items-start gap-2">
+                <span class="min-w-0 flex-1 break-words">{{ tooltipColumnComment ?? columnComment }}</span>
+                <button data-column-header-copy-comment type="button" class="flex h-5 w-5 shrink-0 items-center justify-center rounded hover:bg-accent hover:text-accent-foreground" :title="copyColumnCommentLabel" @click.stop="emit('copyComment')">
+                  <Copy class="h-3 w-3" />
+                </button>
+              </span>
             </template>
             <template v-if="columnNullability">
-              <span class="text-background/70">{{ nullableLabel }}</span>
+              <span class="text-muted-foreground">{{ nullableLabel }}</span>
               <span>{{ columnNullability === "nullable" ? yesLabel : noLabel }}</span>
             </template>
             <template v-if="columnIndexKind && columnIndexKind !== 'none'">
-              <span class="text-background/70">{{ columnIndexLabel }}</span>
+              <span class="text-muted-foreground">{{ columnIndexLabel }}</span>
               <span class="flex items-center gap-1">
                 <KeyRound v-if="columnIndexKind === 'primary'" class="h-3 w-3" :class="columnIndexColorClass(columnIndexKind)" />
                 <Hash v-else class="h-3 w-3" :class="columnIndexColorClass(columnIndexKind)" />
@@ -113,6 +129,10 @@ const emit = defineEmits<{
           </div>
         </template>
       </LightTooltip>
+      <span v-if="formatterActive" data-column-formatter-indicator class="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm bg-violet-600 text-[10px] font-bold leading-none text-white shadow-sm dark:bg-violet-500" :title="formatterLabel" :aria-label="formatterLabel">F</span>
+      <span v-if="highlightActive" data-column-highlight-indicator class="inline-flex h-4 w-4 shrink-0 items-center justify-center text-amber-500 dark:text-amber-400" :title="highlightLabel" :aria-label="highlightLabel">
+        <Highlighter class="h-3 w-3" />
+      </span>
       <span data-column-header-actions class="contents"><slot name="actions" /></span>
     </span>
     <div data-column-resize-handle class="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/30" @mousedown.stop="emit('resizeStart', $event)" @click.stop.prevent @dblclick.stop="emit('autoFit')" />
@@ -155,5 +175,15 @@ const emit = defineEmits<{
 
 .data-grid-header-cell--dark.data-grid-header-cell--frozen-separator {
   border-right: 2px solid rgb(100, 116, 139) !important;
+}
+</style>
+
+<style>
+html.dbx-legacy-webview [data-column-header-copy-name]:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+html.dbx-legacy-webview.dark [data-column-header-copy-name]:hover {
+  background-color: rgba(0, 0, 0, 0.1);
 }
 </style>

@@ -1,5 +1,6 @@
 import type { ConnectionConfig, DatabaseType, TreeNodeType } from "@/types/database";
 import { supportsCreateDatabaseCharset } from "@/lib/database/createDatabaseSql";
+import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
 
 export type DatabasePropertyEditGroup = "charsetCollation" | "databaseComment" | "schemaComment";
 
@@ -9,7 +10,7 @@ export interface DatabasePropertyEditingEntry {
   deferred?: string;
 }
 
-type PropertyEditConnection = Pick<ConnectionConfig, "db_type" | "driver_profile" | "read_only"> | undefined;
+type PropertyEditConnection = (Pick<ConnectionConfig, "db_type" | "driver_profile" | "read_only"> & Partial<Pick<ConnectionConfig, "id">>) | undefined;
 type DatabaseNode = Pick<{ type: TreeNodeType; database?: string | null }, "type" | "database">;
 type SchemaNode = Pick<{ type: TreeNodeType; database?: string | null; schema?: string | null }, "type" | "database" | "schema">;
 
@@ -32,6 +33,9 @@ export const DATABASE_PROPERTY_EDITING_MATRIX = {
   elasticsearch: { deferred: "index settings are not database properties" },
   easysearch: { deferred: "index settings are not database properties" },
   meilisearch: { deferred: "index settings are not database properties" },
+  salesforce: { deferred: "sObject metadata is managed in Salesforce Setup" },
+  solr: { deferred: "core settings are not database properties" },
+  couchdb: { deferred: "database settings are not SQL database properties" },
   hbase: { deferred: "namespace and table properties need a dedicated HBase workflow" },
   qdrant: { deferred: "collection settings are not database properties" },
   milvus: { deferred: "collection/database settings need a dedicated vector workflow" },
@@ -61,22 +65,29 @@ export const DATABASE_PROPERTY_EDITING_MATRIX = {
   "oceanbase-oracle": { deferred: "Oracle-mode schemas are users; use a dedicated user workflow" },
   questdb: { deferred: "single database model in DBX" },
   gbase: { deferred: "schema properties need product-specific handling" },
+  gbase8s: { deferred: "schema properties need product-specific handling" },
+  gbase8c: { deferred: "database and schema comment editing not verified for first pass" },
   access: { deferred: "file-backed database properties are not edited in-place" },
   h2: { deferred: "schema properties need product-specific handling" },
   snowflake: { deferred: "database/schema properties need Snowflake-specific options" },
   trino: { deferred: "catalog properties are connector-managed" },
   prestosql: { deferred: "catalog properties are connector-managed" },
   hive: { deferred: "database properties need agent metadata validation first" },
+  argo: { deferred: "database properties need agent metadata validation first" },
+  transwarp: { deferred: "database properties need server validation first" },
   kyuubi: { deferred: "database properties need Kyuubi-specific validation first" },
   impala: { deferred: "database properties need Impala-specific validation first" },
   spark: { deferred: "database properties need agent metadata validation first" },
   db2: { deferred: "schema properties need product-specific handling" },
   informix: { deferred: "schema properties need product-specific handling" },
   neo4j: { deferred: "database properties depend on edition/admin privileges" },
+  nebula: { deferred: "space properties require NebulaGraph-specific administration" },
   cassandra: { deferred: "keyspace properties require replication option handling" },
   bigquery: { deferred: "dataset properties need project/location-specific handling" },
+  spanner: { deferred: "database/schema properties are Cloud Spanner Admin API operations" },
   kylin: { deferred: "project/model lifecycle is not SQL database property editing" },
   ignite: { deferred: "schema properties need product-specific handling" },
+  ignite3: { deferred: "schema properties need product-specific handling" },
   sundb: { deferred: "property semantics not verified for first pass" },
   oscar: { deferred: "schema properties need product-specific handling" },
   tdengine: { deferred: "database property editing not verified for first pass" },
@@ -86,8 +97,10 @@ export const DATABASE_PROPERTY_EDITING_MATRIX = {
   zookeeper: { deferred: "key-value namespaces are not databases" },
   iris: { deferred: "schema properties need product-specific handling" },
   influxdb: { deferred: "database retention policies need a dedicated workflow" },
+  influxdb3: { deferred: "database retention policies need a dedicated workflow" },
   victoriametrics: { deferred: "metric and retention settings are managed by VictoriaMetrics deployment configuration" },
   jdbc: { deferred: "generic JDBC does not expose reliable dialect-specific properties" },
+  plugin: { deferred: "plugin-owned properties are managed by the provider workbench" },
   mq: { deferred: "message queue namespaces are handled by MQ admin panels" },
   nacos: { deferred: "Nacos namespace editing already uses the Nacos admin flow" },
   consul: { deferred: "Consul KV scopes are configured on the connection" },
@@ -95,7 +108,7 @@ export const DATABASE_PROPERTY_EDITING_MATRIX = {
 } satisfies Record<DatabaseType, DatabasePropertyEditingEntry>;
 
 function entryFor(connection: PropertyEditConnection): DatabasePropertyEditingEntry | null {
-  if (!connection || connection.read_only) return null;
+  if (!connection || connectionIsEffectivelyReadOnly(connection)) return null;
   return DATABASE_PROPERTY_EDITING_MATRIX[connection.db_type] ?? null;
 }
 

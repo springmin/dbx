@@ -18,13 +18,14 @@ import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomC
 import NacosConfigDiffDialog from "@/components/nacos/NacosConfigDiffDialog.vue";
 import KvValueEditor from "@/components/kv/KvValueEditor.vue";
 import type { KvCreateMode, KvDeleteOptions, KvGetOptions, KvGetResponse, KvHistoryEvent, KvHistoryResponse, KvInt64, KvKeySummary, KvListPrefixOptions, KvPutOptions, KvPutResponse, KvValue } from "@/lib/backend/api";
+import { formatError } from "@/lib/backend/errorUtils";
 import type { KvExportScopeRequest } from "@/lib/kv/kvExportScope";
 import { buildKvKeyTree, flattenVisibleKvKeyTree, kvKeyTreeNodePath, preserveKvExpandedGroupIds, type KvKeyTreeNode } from "@/lib/kv/kvKeyTree";
 import { decideKvMetadataRefresh, hasPositiveKvLease, knownKvLeaseSummaries, mergeKvKeyMetadata, mergeKvValueRefresh, nextKvLeaseRefreshDelay, removeMissingKvKey, updateKvResponseTtl } from "@/lib/kv/kvMetadataRefresh";
 import { classifyKvMutationError, type KvMutationErrorKind } from "@/lib/kv/kvMutationError";
 import { refreshedKvSelectionSummary } from "@/lib/kv/kvRefreshSelection";
 import { parseKvLeaseId, parseOptionalTtl } from "@/lib/kv/kvTtl";
-import { formatZooKeeperMetadataRows, formatZooKeeperSummaryBadges, prettyPrintJsonText } from "@/lib/kv/kvValueDisplay";
+import { decodeBase64Utf8Preview, formatZooKeeperMetadataRows, formatZooKeeperSummaryBadges, prettyPrintJsonText } from "@/lib/kv/kvValueDisplay";
 import { formatTtl } from "@/lib/common/ttlFormat";
 import {
   createLazyKvKeyTreeState,
@@ -43,9 +44,11 @@ import {
   type LazyKvPathStyle,
 } from "@/lib/kv/slashPrefixLazyKeyTree";
 import { useToast } from "@/composables/useToast";
+import { useTabUiState } from "@/lib/tabs/tabUiState";
 import { detectKvValueFormat, validateKvValue, type KvValueFormat } from "@/lib/kv/kvValueFormat";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { copyToClipboard } from "@/lib/common/clipboard";
+import { saveTextFile } from "@/lib/export/saveTextFile";
 
 interface KvKeyBrowserLabels {
   prefixPlaceholder: string;
@@ -118,6 +121,8 @@ interface KvKeyBrowserLabels {
   copy?: string;
   copied?: string;
   copyFailed?: string;
+  utf8PreviewLossy?: string;
+  utf8PreviewUnavailable?: string;
   valueTooLarge?: string;
   deletePrefix?: string;
   selectAll?: string;
@@ -195,11 +200,13 @@ const props = withDefaults(
     safeWrite?: boolean;
     maxValueBytes?: number;
     allowBinaryEdit?: boolean;
+    enableBase64Utf8Preview?: boolean;
     readOnly?: boolean;
     exportFormat?: string;
     exportFileExtension?: string;
     exportFallbackName?: string;
     enableMultiSelect?: boolean;
+    canWriteKey?: (route: KvKeyRoute) => boolean;
     onWatchKey?: (route: KvKeyRoute) => void;
     onDeletePrefix?: (prefix: string) => void;
     watchActiveKey?: string | null;
@@ -221,6 +228,7 @@ const props = withDefaults(
     safeWrite: false,
     maxValueBytes: 0,
     allowBinaryEdit: false,
+    enableBase64Utf8Preview: false,
     readOnly: false,
     exportFormat: "dbx-kv-bundle",
     exportFileExtension: ".dbx-kv.json",
@@ -235,12 +243,36 @@ const emit = defineEmits<{
   selectionChange: [selection: KvMultiSelection[]];
 }>();
 
+interface KvTabUiState {
+  prefix?: string;
+  expandedGroupIds?: string[];
+  selectedKey?: string | null;
+  showEditDialog?: boolean;
+  isCreating?: boolean;
+  editKey?: string;
+  editValue?: string;
+  editTtl?: string | number;
+  editFlags?: string;
+  editExpiryMode?: KvExpiryMode;
+  editLeaseId?: string;
+  editFormat?: KvValueFormat;
+  editEncoding?: "utf8" | "base64";
+  showRenameDialog?: boolean;
+  renameValue?: string;
+  renameMode?: "rename" | "copy";
+  selectedCreateMode?: KvCreateMode;
+  selectedBase64ViewMode?: "utf8" | "base64";
+  kvBrowserSplitSize?: number;
+}
+
+const { initialState: restoredUiState, track: trackUiState } = useTabUiState<KvTabUiState>({}, "KvKeyBrowser");
+
 const { t } = useI18n();
 const { toast } = useToast();
 const connectionStore = useConnectionStore();
 const settingsStore = useSettingsStore();
 const searchInputRef = ref<HTMLInputElement>();
-const prefix = ref("");
+const prefix = ref(restoredUiState.prefix ?? "");
 const keySuggestionOpen = ref(false);
 const keySuggestionIndex = ref(-1);
 const remoteKeySuggestions = ref<KvKeySummary[]>([]);
@@ -251,23 +283,23 @@ const listFilteredByAcls = ref(false);
 const loading = ref(false);
 const loadingMore = ref(false);
 const listError = ref("");
-const expandedGroupIds = ref<Set<string>>(new Set());
-const selectedKey = ref<string | null>(null);
-const selectedKeyIdentity = ref<string | null>(null);
+const expandedGroupIds = ref<Set<string>>(new Set(restoredUiState.expandedGroupIds ?? []));
+const selectedKey = ref<string | null>(restoredUiState.selectedKey ?? null);
+const selectedKeyIdentity = ref<string | null>(restoredUiState.selectedKey ?? null);
 const selectedRouteKeyBytes = ref<KvValue | null>(null);
 const selectedValue = ref<KvGetResponse | null>(null);
 const detailLoading = ref(false);
 const detailError = ref("");
-const showEditDialog = ref(false);
-const isCreating = ref(false);
-const editKey = ref("");
-const editValue = ref("");
-const editTtl = ref<string | number>("");
-const editFlags = ref("0");
-const editExpiryMode = ref<KvExpiryMode>("permanent");
-const editLeaseId = ref("");
-const editFormat = ref<KvValueFormat>("text");
-const editEncoding = ref<"utf8" | "base64">("utf8");
+const showEditDialog = ref(restoredUiState.showEditDialog ?? false);
+const isCreating = ref(restoredUiState.isCreating ?? false);
+const editKey = ref(restoredUiState.editKey ?? "");
+const editValue = ref(restoredUiState.editValue ?? "");
+const editTtl = ref<string | number>(restoredUiState.editTtl ?? "");
+const editFlags = ref(restoredUiState.editFlags ?? "0");
+const editExpiryMode = ref<KvExpiryMode>(restoredUiState.editExpiryMode ?? "permanent");
+const editLeaseId = ref(restoredUiState.editLeaseId ?? "");
+const editFormat = ref<KvValueFormat>(restoredUiState.editFormat ?? "text");
+const editEncoding = ref<"utf8" | "base64">(restoredUiState.editEncoding ?? "utf8");
 const editError = ref("");
 const editErrorKind = ref<KvMutationErrorKind>("request");
 const saving = ref(false);
@@ -276,11 +308,11 @@ const showSaveDiff = ref(false);
 const pendingSave = ref<{ key: string; value: KvValue; options?: KvPutOptions } | null>(null);
 const showDeleteConfirm = ref(false);
 const deleting = ref(false);
-const showRenameDialog = ref(false);
-const renameValue = ref("");
+const showRenameDialog = ref(restoredUiState.showRenameDialog ?? false);
+const renameValue = ref(restoredUiState.renameValue ?? "");
 const renameError = ref("");
 const renaming = ref(false);
-const renameMode = ref<"rename" | "copy">("rename");
+const renameMode = ref<"rename" | "copy">(restoredUiState.renameMode ?? "rename");
 const showHistoryDialog = ref(false);
 const historyLoading = ref(false);
 const historyError = ref("");
@@ -288,8 +320,9 @@ const historyEvents = ref<KvHistoryEvent[]>([]);
 const selectedHistoryEvent = ref<KvHistoryEvent | null>(null);
 const showHistoryDiff = ref(false);
 const restoring = ref(false);
-const selectedCreateMode = ref<KvCreateMode>("persistent");
+const selectedCreateMode = ref<KvCreateMode>(restoredUiState.selectedCreateMode ?? "persistent");
 const selectedPrettyValue = ref<string | null>(null);
+const selectedBase64ViewMode = ref<"utf8" | "base64">(restoredUiState.selectedBase64ViewMode ?? "utf8");
 const selectedValueCopied = ref(false);
 const lazyTreeState = reactive(createLazyKvKeyTreeState(lazyKvRootPath(props.lazyPathStyle), props.lazyPathStyle));
 const multiSelectedKeys = ref<Map<string, KvMultiSelection>>(new Map());
@@ -299,7 +332,29 @@ const keyListRefreshBaseIntervalMs = 2000;
 const keyListRefreshMaxIntervalMs = 30000;
 const kvBrowserSplitSizeStorageKey = "dbx-kv-browser-split-size";
 const savedKvBrowserSplitSize = Number(safeLocalStorageGet(kvBrowserSplitSizeStorageKey));
-const kvBrowserSplitSize = ref(savedKvBrowserSplitSize >= 20 && savedKvBrowserSplitSize <= 70 ? savedKvBrowserSplitSize : 38);
+const kvBrowserSplitSize = ref(restoredUiState.kvBrowserSplitSize ?? (savedKvBrowserSplitSize >= 20 && savedKvBrowserSplitSize <= 70 ? savedKvBrowserSplitSize : 38));
+
+trackUiState(() => ({
+  prefix: prefix.value,
+  expandedGroupIds: [...expandedGroupIds.value].slice(0, 512),
+  selectedKey: selectedKey.value,
+  showEditDialog: showEditDialog.value,
+  isCreating: isCreating.value,
+  editKey: editKey.value,
+  editValue: editValue.value,
+  editTtl: editTtl.value,
+  editFlags: editFlags.value,
+  editExpiryMode: editExpiryMode.value,
+  editLeaseId: editLeaseId.value,
+  editFormat: editFormat.value,
+  editEncoding: editEncoding.value,
+  showRenameDialog: showRenameDialog.value,
+  renameValue: renameValue.value,
+  renameMode: renameMode.value,
+  selectedCreateMode: selectedCreateMode.value,
+  selectedBase64ViewMode: selectedBase64ViewMode.value,
+  kvBrowserSplitSize: kvBrowserSplitSize.value,
+}));
 let keyLoadGeneration = 0;
 let detailRequestId = 0;
 let metadataRefreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -385,9 +440,44 @@ const selectedTextValue = computed(() => {
   if (!value) return "";
   return value.encoding === "utf8" ? value.data : value.data;
 });
-const displayedSelectedTextValue = computed(() => selectedPrettyValue.value ?? selectedTextValue.value);
 const selectedValueIsBase64 = computed(() => selectedValue.value?.value?.encoding === "base64");
+const selectedBase64Utf8Preview = computed(() => {
+  if (!props.enableBase64Utf8Preview || !selectedValueIsBase64.value) return null;
+  return decodeBase64Utf8Preview(selectedTextValue.value);
+});
+const showSelectedBase64Utf8Controls = computed(() => props.enableBase64Utf8Preview && selectedValueIsBase64.value);
+const selectedBase64DisplayMode = computed<"utf8" | "base64">(() => (selectedBase64ViewMode.value === "utf8" && selectedBase64Utf8Preview.value?.ok ? "utf8" : "base64"));
+const selectedValueUsesUtf8Preview = computed(() => showSelectedBase64Utf8Controls.value && selectedBase64DisplayMode.value === "utf8");
+const selectedBase64Utf8PreviewIsLossy = computed(() => {
+  const preview = selectedBase64Utf8Preview.value;
+  return preview?.ok === true && preview.lossy;
+});
+const selectedBase64Utf8PreviewUnavailable = computed(() => selectedBase64Utf8Preview.value?.ok === false);
+const displayedSelectedTextValue = computed(() => {
+  if (selectedPrettyValue.value != null) return selectedPrettyValue.value;
+  const preview = selectedBase64Utf8Preview.value;
+  return selectedValueUsesUtf8Preview.value && preview?.ok ? preview.value : selectedTextValue.value;
+});
+const selectedValueClipboardText = computed(() => {
+  const preview = selectedBase64Utf8Preview.value;
+  return selectedValueUsesUtf8Preview.value && preview?.ok ? preview.value : selectedTextValue.value;
+});
 const selectedKeyBytes = computed(() => selectedValue.value?.keyBytes ?? selectedRouteKeyBytes.value ?? null);
+function keyIsWritable(key: string, keyBytes?: KvValue | null): boolean {
+  return !props.readOnly && (props.canWriteKey?.({ key, keyBytes }) ?? true);
+}
+const selectedKeyWritable = computed(() => Boolean(selectedKey.value && keyIsWritable(selectedKey.value, selectedKeyBytes.value)));
+const editKeyWritable = computed(() => {
+  const key = editKey.value.trim();
+  if (!key) return false;
+  const keyBytes = !isCreating.value && key === selectedKey.value ? selectedKeyBytes.value : null;
+  return keyIsWritable(key, keyBytes);
+});
+const renameTargetWritable = computed(() => {
+  const target = renameValue.value.trim();
+  if (!target) return false;
+  return keyIsWritable(target) && (renameMode.value === "copy" || selectedKeyWritable.value);
+});
 const selectedKeyLocked = computed(() => Boolean(String(selectedMetadata.value?.session ?? "").trim()));
 const isWatchingSelectedKey = computed(() => Boolean(selectedKey.value && props.watchActiveKey === selectedKey.value));
 const activeSearchHighlight = computed(() => (props.searchHighlight?.key === selectedKey.value ? props.searchHighlight : null));
@@ -435,8 +525,8 @@ const editValueSize = computed(() => {
   }
   return new TextEncoder().encode(editValue.value).length;
 });
-const canEditSelectedValue = computed(() => !props.readOnly && !selectedKeyLocked.value && (!selectedValueIsBase64.value || props.allowBinaryEdit));
-const canDeleteSelectedValue = computed(() => !props.readOnly && !selectedKeyLocked.value);
+const canEditSelectedValue = computed(() => selectedKeyWritable.value && !selectedKeyLocked.value && (!selectedValueIsBase64.value || props.allowBinaryEdit));
+const canDeleteSelectedValue = computed(() => selectedKeyWritable.value && !selectedKeyLocked.value);
 const consulMetadataRows = computed(() => {
   const metadata = selectedMetadata.value;
   return [
@@ -624,7 +714,7 @@ async function loadKeys(reset = true, options: LoadKeysOptions = {}) {
     }
   } catch (error) {
     if (reset && generation === keyLoadGeneration && props.connectionId === connectionId) {
-      listError.value = error instanceof Error ? error.message : String(error);
+      listError.value = formatError(error);
     }
   } finally {
     if (generation === keyLoadGeneration && props.connectionId === connectionId) {
@@ -704,7 +794,7 @@ async function loadLazyRoot(reset = true, options: LoadKeysOptions = {}) {
     }
   } catch (error) {
     if (lazyLoadContextValid(context)) {
-      listError.value = error instanceof Error ? error.message : String(error);
+      listError.value = formatError(error);
     }
   } finally {
     if (lazyLoadContextValid(context)) loading.value = false;
@@ -844,7 +934,7 @@ async function refreshLazyParent(parentPath: string) {
   }
 }
 
-async function loadSelectedKey(input: string | KvKeyRoute) {
+async function loadSelectedKey(input: string | KvKeyRoute): Promise<boolean> {
   const route = routeFromKey(input);
   const key = route.key;
   const keyIdentity = routeIdentity(route);
@@ -856,11 +946,12 @@ async function loadSelectedKey(input: string | KvKeyRoute) {
   selectedRouteKeyBytes.value = route.keyBytes ?? null;
   selectedValue.value = null;
   selectedPrettyValue.value = null;
+  selectedBase64ViewMode.value = "utf8";
   detailLoading.value = true;
   detailError.value = "";
   try {
     const result = await props.api.get(connectionId, key, route.keyBytes ? { keyBytes: route.keyBytes } : undefined);
-    if (requestId !== detailRequestId || selectedKey.value !== key || connectionId !== props.connectionId) return;
+    if (requestId !== detailRequestId || selectedKey.value !== key || connectionId !== props.connectionId) return false;
     const lazyNode = lazyTreeState.nodeByKey.get(key);
     if (lazyNode) {
       lazyNode.hasValue = result.found;
@@ -868,16 +959,18 @@ async function loadSelectedKey(input: string | KvKeyRoute) {
     }
     if (!result.found) {
       removeExpiredSelectedKey(key);
-      return;
+      return false;
     }
     selectedValue.value = result;
     selectedKeyIdentity.value = result.keyIdentity ?? selectedKeyIdentity.value;
     selectedRouteKeyBytes.value = result.keyBytes ?? selectedRouteKeyBytes.value;
     startMetadataRefresh(key);
     startKeyListRefresh();
+    return true;
   } catch (error) {
-    if (requestId !== detailRequestId || selectedKey.value !== key || connectionId !== props.connectionId) return;
-    detailError.value = error instanceof Error ? error.message : String(error);
+    if (requestId !== detailRequestId || selectedKey.value !== key || connectionId !== props.connectionId) return false;
+    detailError.value = formatError(error);
+    return false;
   } finally {
     if (requestId === detailRequestId && connectionId === props.connectionId) detailLoading.value = false;
   }
@@ -891,6 +984,7 @@ function clearSelectedKey() {
   selectedRouteKeyBytes.value = null;
   selectedValue.value = null;
   selectedPrettyValue.value = null;
+  selectedBase64ViewMode.value = "utf8";
   detailLoading.value = false;
 }
 
@@ -1231,6 +1325,11 @@ async function saveKey() {
     return;
   }
   const key = props.lazyHierarchy ? normalizeLazyKvPath(rawKey, props.lazyPathStyle) : rawKey;
+  const keyBytes = !isCreating.value && key === selectedKey.value ? selectedKeyBytes.value : null;
+  if (!keyIsWritable(key, keyBytes)) {
+    editError.value = t("connection.readOnly");
+    return;
+  }
   const validationError = validateKvValue(editValue.value, editFormat.value);
   if (validationError) {
     editError.value = validationError;
@@ -1248,6 +1347,7 @@ async function saveKey() {
 async function confirmSaveKey() {
   if (!pendingSave.value) return;
   const { key, value, options } = pendingSave.value;
+  if (!keyIsWritable(key, options?.keyBytes)) return;
   saving.value = true;
   editError.value = "";
   editErrorKind.value = "request";
@@ -1318,7 +1418,7 @@ async function deleteSelectedKey() {
     }
     toast(props.labels.deleted, 2500);
   } catch (error) {
-    detailError.value = error instanceof Error ? error.message : String(error);
+    detailError.value = formatError(error);
     showDeleteConfirm.value = false;
   } finally {
     deleting.value = false;
@@ -1340,7 +1440,8 @@ async function selectNodeForAction(node: BrowserTreeNode) {
 }
 
 async function openDeleteForNode(node: BrowserTreeNode) {
-  if (props.readOnly) return;
+  const route = routeFromNode(node);
+  if (!keyIsWritable(route.key, route.keyBytes)) return;
   await selectNodeForAction(node);
   if (!selectedKey.value || !selectedValue.value?.found || !canDeleteSelectedValue.value) return;
   showDeleteConfirm.value = true;
@@ -1364,7 +1465,7 @@ async function copyText(value: string | number | null | undefined) {
 async function copySelectedValue() {
   if (!selectedValue.value?.found) return;
   try {
-    await copyToClipboard(selectedTextValue.value);
+    await copyToClipboard(selectedValueClipboardText.value);
     selectedValueCopied.value = true;
     toast(props.labels.copied || "Copied", 1500);
     if (selectedValueCopyTimer) clearTimeout(selectedValueCopyTimer);
@@ -1374,7 +1475,7 @@ async function copySelectedValue() {
     }, 1500);
   } catch (error) {
     selectedValueCopied.value = false;
-    const message = error instanceof Error ? error.message : String(error);
+    const message = formatError(error);
     const failureTemplate = props.labels.copyFailed || "Copy failed: {message}";
     toast(failureTemplate.includes("{message}") ? failureTemplate.replace("{message}", message) : `${failureTemplate}: ${message}`, 3500);
   }
@@ -1389,54 +1490,47 @@ function watchSelectedKey() {
   });
 }
 
-function downloadText(filename: string, content: string, type = "application/json") {
-  const url = URL.createObjectURL(new Blob([content], { type }));
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  URL.revokeObjectURL(url);
-}
-
-function exportSelectedKey() {
-  if (!selectedKey.value || !selectedValue.value?.found) return;
-  downloadText(
-    `${selectedKey.value.split("/").filter(Boolean).pop() || props.exportFallbackName}${props.exportFileExtension}`,
-    JSON.stringify(
-      {
-        format: props.exportFormat,
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        prefix: selectedKey.value,
-        scopeKind: "key",
-        entries: [
-          {
-            key: selectedKeyBytes.value ?? { encoding: "utf8", data: selectedKey.value },
-            value: selectedValue.value.value,
-            metadata: selectedValue.value.metadata,
-            formatHint: detectKvValueFormat(selectedTextValue.value, selectedValueIsBase64.value ? "base64" : "utf8"),
-          },
-        ],
-      },
-      null,
-      2,
-    ),
+async function exportSelectedKey(): Promise<boolean> {
+  if (!selectedKey.value || !selectedValue.value?.found) return false;
+  const filename = `${selectedKey.value.split("/").filter(Boolean).pop() || props.exportFallbackName}${props.exportFileExtension}`;
+  const content = JSON.stringify(
+    {
+      format: props.exportFormat,
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      prefix: selectedKey.value,
+      scopeKind: "key",
+      entries: [
+        {
+          key: selectedKeyBytes.value ?? { encoding: "utf8", data: selectedKey.value },
+          value: selectedValue.value.value,
+          metadata: selectedValue.value.metadata,
+          formatHint: detectKvValueFormat(selectedTextValue.value, selectedValueIsBase64.value ? "base64" : "utf8"),
+        },
+      ],
+    },
+    null,
+    2,
   );
+  return Boolean(await saveTextFile(content, filename, "DBX KV Bundle", "json", { operation: "kv-key-export" }));
 }
 
 async function exportNode(node: BrowserTreeNode) {
-  const request: KvExportScopeRequest = {
-    path: nodePath(node),
-    kind: nodeIsExpandable(node) ? "prefix" : "key",
-    keyBytes: node.kind === "lazy" ? null : node.keyBytes,
-  };
-  if (props.api.exportScope) {
-    await props.api.exportScope(props.connectionId, request);
-    return;
+  try {
+    const request: KvExportScopeRequest = {
+      path: nodePath(node),
+      kind: nodeIsExpandable(node) ? "prefix" : "key",
+      keyBytes: node.kind === "lazy" ? null : node.keyBytes,
+    };
+    if (props.api.exportScope) {
+      await props.api.exportScope(props.connectionId, request);
+      return;
+    }
+    if (!nodeHasValue(node)) return;
+    if (await loadSelectedKey(routeFromNode(node))) await exportSelectedKey();
+  } catch (error) {
+    toast(formatError(error), 4000);
   }
-  if (!nodeHasValue(node)) return;
-  await loadSelectedKey(routeFromNode(node));
-  exportSelectedKey();
 }
 
 async function openCloneDialog() {
@@ -1472,7 +1566,7 @@ function onEditFormatChange(value: unknown) {
 }
 
 function openRenameDialog() {
-  if (!selectedKey.value || !props.api.rename || props.readOnly) return;
+  if (!selectedKey.value || !props.api.rename || !selectedKeyWritable.value) return;
   renameMode.value = "rename";
   renameValue.value = selectedKey.value;
   renameError.value = "";
@@ -1486,6 +1580,10 @@ async function moveOrCopySelectedKey() {
   const next = renameValue.value.trim();
   if (!next) {
     renameError.value = props.labels.keyRequired;
+    return;
+  }
+  if (!renameTargetWritable.value) {
+    renameError.value = t("connection.readOnly");
     return;
   }
   renaming.value = true;
@@ -1502,7 +1600,7 @@ async function moveOrCopySelectedKey() {
     await loadSelectedKey({ key: next, keyIdentity: next, keyBytes: { encoding: "utf8", data: next } });
     toast(props.labels.saved, 2500);
   } catch (error) {
-    renameError.value = error instanceof Error ? error.message : String(error);
+    renameError.value = formatError(error);
   } finally {
     renaming.value = false;
   }
@@ -1525,7 +1623,7 @@ async function openHistory() {
     historyEvents.value = response.events;
   } catch (error) {
     historyEvents.value = [];
-    historyError.value = error instanceof Error ? error.message : String(error);
+    historyError.value = formatError(error);
   } finally {
     historyLoading.value = false;
   }
@@ -1537,7 +1635,7 @@ function compareHistory(event: KvHistoryEvent) {
 }
 
 async function restoreHistory() {
-  if (!selectedKey.value || !historyRestoreValue.value) return;
+  if (!selectedKey.value || !historyRestoreValue.value || !selectedKeyWritable.value) return;
   restoring.value = true;
   try {
     await props.api.put(props.connectionId, selectedKey.value, historyRestoreValue.value, {
@@ -1549,7 +1647,7 @@ async function restoreHistory() {
     await loadKeys(true, { preserveSelection: true });
     toast(props.labels.saved, 2500);
   } catch (error) {
-    historyError.value = error instanceof Error ? error.message : String(error);
+    historyError.value = formatError(error);
   } finally {
     restoring.value = false;
   }
@@ -1557,6 +1655,8 @@ async function restoreHistory() {
 
 function nodeContextMenuItems(node: BrowserTreeNode): ContextMenuItem[] {
   if (!props.enableNodeActions) return [];
+  const route = routeFromNode(node);
+  const nodeWritable = keyIsWritable(route.key, route.keyBytes);
   const items: ContextMenuItem[] = [
     {
       label: props.labels.add || props.labels.newKey,
@@ -1571,7 +1671,7 @@ function nodeContextMenuItems(node: BrowserTreeNode): ContextMenuItem[] {
         label: props.labels.edit,
         icon: Pencil,
         action: () => void loadSelectedKey(routeFromNode(node)).then(openEditDialog),
-        disabled: props.readOnly,
+        disabled: !nodeWritable,
       },
       {
         label: props.labels.clone || "Clone",
@@ -1590,7 +1690,7 @@ function nodeContextMenuItems(node: BrowserTreeNode): ContextMenuItem[] {
         label: props.labels.rename || "Rename",
         icon: Pencil,
         action: () => void loadSelectedKey(routeFromNode(node)).then(openRenameDialog),
-        disabled: props.readOnly,
+        disabled: !nodeWritable,
       });
     }
     if (props.api.history) {
@@ -1622,7 +1722,7 @@ function nodeContextMenuItems(node: BrowserTreeNode): ContextMenuItem[] {
       icon: Trash2,
       variant: "destructive",
       action: () => void openDeleteForNode(node),
-      disabled: props.readOnly || !nodeHasValue(node),
+      disabled: !nodeWritable || !nodeHasValue(node),
     });
   }
   return items;
@@ -1721,7 +1821,7 @@ watch(
     clearSelectedKey();
     clearMultiSelection();
     try {
-      await connectionStore.ensureConnected(props.connectionId);
+      await connectionStore.ensureConnected(props.connectionId, { skipIfClosedByUser: true });
     } catch {
       // Connection failed — loadKeys will show the error state
     }
@@ -1768,12 +1868,12 @@ watch(editKey, () => {
 onMounted(() => {
   initialLoadPromise = (async () => {
     try {
-      await connectionStore.ensureConnected(props.connectionId);
+      await connectionStore.ensureConnected(props.connectionId, { skipIfClosedByUser: true });
     } catch (e) {
       console.warn("[DBX] ensureConnected failed for", props.connectionId, e);
     }
     try {
-      await loadKeys(true);
+      await loadKeys(true, { preserveSelection: Boolean(restoredUiState.selectedKey) });
     } catch {
       // The browser's normal refresh path can retry after a transient failure.
     }
@@ -2025,7 +2125,23 @@ defineExpose({
                 </div>
               </div>
               <div class="min-h-0">
-                <div v-if="metadataStyle === 'zookeeper'" class="mb-2 text-xs font-medium text-muted-foreground">{{ labels.value || "Value" }}</div>
+                <div v-if="metadataStyle === 'zookeeper' || showSelectedBase64Utf8Controls" class="mb-2 flex min-h-8 items-center justify-between gap-3">
+                  <div v-if="metadataStyle === 'zookeeper'" class="text-xs font-medium text-muted-foreground">{{ labels.value || "Value" }}</div>
+                  <div v-if="showSelectedBase64Utf8Controls" class="ml-auto inline-flex rounded-md border bg-muted/20 p-0.5" role="group" aria-label="Value encoding">
+                    <Button
+                      data-testid="kv-base64-utf8-view"
+                      size="sm"
+                      :variant="selectedBase64DisplayMode === 'utf8' ? 'secondary' : 'ghost'"
+                      class="h-7 rounded-sm px-2.5 text-xs"
+                      :aria-pressed="selectedBase64DisplayMode === 'utf8'"
+                      :disabled="selectedBase64Utf8PreviewUnavailable"
+                      @click="selectedBase64ViewMode = 'utf8'"
+                    >
+                      UTF-8
+                    </Button>
+                    <Button data-testid="kv-base64-raw-view" size="sm" :variant="selectedBase64DisplayMode === 'base64' ? 'secondary' : 'ghost'" class="h-7 rounded-sm px-2.5 text-xs" :aria-pressed="selectedBase64DisplayMode === 'base64'" @click="selectedBase64ViewMode = 'base64'"> Base64 </Button>
+                  </div>
+                </div>
                 <div class="relative">
                   <Button
                     size="icon"
@@ -2043,6 +2159,12 @@ defineExpose({
                     class="dbx-editor-font-family m-0 max-h-[40vh] min-h-32 overflow-auto rounded-md border bg-muted/20 p-3 pr-12 text-sm"
                     :class="settingsStore.editorSettings.wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'"
                   ><template v-for="(segment, index) in selectedValueHighlightSegments" :key="index"><mark v-if="segment.matched" class="rounded-sm bg-amber-300/80 px-0.5 text-foreground dark:bg-amber-500/40">{{ segment.text }}</mark><span v-else>{{ segment.text }}</span></template></pre>
+                </div>
+                <div v-if="selectedValueUsesUtf8Preview && selectedBase64Utf8PreviewIsLossy" class="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                  {{ labels.utf8PreviewLossy || "Invalid UTF-8 bytes are shown as replacement characters (�). The original Base64 value is unchanged." }}
+                </div>
+                <div v-else-if="showSelectedBase64Utf8Controls && selectedBase64Utf8PreviewUnavailable" class="mt-2 text-xs text-destructive">
+                  {{ labels.utf8PreviewUnavailable || "The Base64 value is invalid, so the original value is shown." }}
                 </div>
                 <div v-if="selectedValueCanPrettyJson" class="mt-2 flex justify-end">
                   <Button size="sm" variant="outline" class="h-8" @click="prettifySelectedJson">
@@ -2190,7 +2312,7 @@ defineExpose({
         </div>
         <DialogFooter class="mx-0 mb-0 shrink-0 gap-3 border-t bg-muted/10 px-6 py-5">
           <Button variant="outline" class="h-10 min-w-20" @click="showEditDialog = false">{{ t("common.cancel") }}</Button>
-          <Button class="h-10 min-w-20" :disabled="saving || readOnly" @click="saveKey">
+          <Button class="h-10 min-w-20" :disabled="saving || !editKeyWritable" @click="saveKey">
             <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
             {{ t("common.save") }}
           </Button>
@@ -2211,7 +2333,7 @@ defineExpose({
         </div>
         <DialogFooter>
           <Button variant="outline" :disabled="renaming" @click="showRenameDialog = false">{{ t("common.cancel") }}</Button>
-          <Button :disabled="renaming || readOnly" @click="moveOrCopySelectedKey">
+          <Button :disabled="renaming || !renameTargetWritable" @click="moveOrCopySelectedKey">
             <Loader2 v-if="renaming" class="mr-2 h-4 w-4 animate-spin" />
             {{ renameMode === "copy" ? labels.clone || "Clone" : labels.rename || "Rename" }}
           </Button>
@@ -2268,7 +2390,7 @@ defineExpose({
       :before="selectedTextValue"
       :after="historyRestoreValue?.data || ''"
       :loading="restoring"
-      :show-confirm="!readOnly && !!historyRestoreValue"
+      :show-confirm="selectedKeyWritable && !!historyRestoreValue"
       :confirm-label="labels.restore || 'Restore'"
       @confirm="restoreHistory"
     />

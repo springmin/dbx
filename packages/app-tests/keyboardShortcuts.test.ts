@@ -2,15 +2,21 @@ import { strict as assert } from "node:assert";
 import { afterAll, beforeAll, test, vi } from "vitest";
 import {
   eventToShortcut,
+  handleTabHistoryNavigationShortcut,
   isBrowserReloadShortcut,
+  isBrowserTaskManagerShortcut,
   isCancelSearchShortcut,
   isCloseOtherTabsShortcut,
   isCloseTabShortcut,
+  isCloseWindowShortcut,
   isCopySidebarSelectionShortcut,
+  isDisconnectSidebarConnectionShortcut,
   isExecuteSqlShortcut,
   isEditSidebarConnectionShortcut,
   isFocusSearchShortcut,
   isModRShortcut,
+  isNavigateTabHistoryBackShortcut,
+  isNavigateTabHistoryForwardShortcut,
   isNewQueryShortcut,
   isObjectSourceSaveShortcutTarget,
   isOpenSettingsShortcut,
@@ -22,13 +28,15 @@ import {
   isSwitchToPreviousTabShortcut,
   isCopyCurrentRowShortcut,
   isDeleteCurrentRowShortcut,
+  isEditCellShortcut,
+  isToggleResultsPaneShortcut,
   isToggleTransposeShortcut,
   isZoomInShortcut,
   isZoomOutShortcut,
   matchesShortcut,
   switchToTabIndexFromShortcut,
 } from "../../apps/desktop/src/lib/editor/keyboardShortcuts.ts";
-import { shortcutToCodeMirrorKey } from "../../apps/desktop/src/lib/editor/shortcutRegistry.ts";
+import { DEFAULT_SHORTCUT_SETTINGS, findShortcutConflict, needsTabNavigationHistoryShortcutMigration, normalizeShortcutSettings, shortcutToCodeMirrorKey, tabNavigationHistoryDefaultShortcut } from "../../apps/desktop/src/lib/editor/shortcutRegistry.ts";
 
 beforeAll(() => vi.stubGlobal("navigator", { platform: "Linux x86_64" }));
 afterAll(() => vi.unstubAllGlobals());
@@ -80,6 +88,152 @@ test("matches Shift+Mod+brackets for switching adjacent tabs", () => {
   assert.equal(isSwitchToNextTabShortcut({ key: "]", ctrlKey: true, shiftKey: true }), true);
   assert.equal(isSwitchToPreviousTabShortcut({ key: "[", metaKey: true }), false);
   assert.equal(isSwitchToNextTabShortcut({ key: "]", metaKey: true }), false);
+});
+
+test("navigates backward and forward through tab visit history with Ctrl+Alt+Arrow keys", () => {
+  assert.equal(isNavigateTabHistoryBackShortcut({ key: "ArrowLeft", ctrlKey: true, altKey: true }), true);
+  assert.equal(isNavigateTabHistoryForwardShortcut({ key: "ArrowRight", ctrlKey: true, altKey: true }), true);
+  assert.equal(isNavigateTabHistoryBackShortcut({ key: "ArrowLeft", ctrlKey: true, altKey: true }, undefined, "Win32"), true);
+  assert.equal(isNavigateTabHistoryBackShortcut({ key: "ArrowLeft", metaKey: true, altKey: true }, undefined, "Win32"), true);
+  assert.equal(isNavigateTabHistoryBackShortcut({ key: "ArrowLeft", ctrlKey: true }), false);
+  assert.equal(isNavigateTabHistoryForwardShortcut({ key: "ArrowRight", altKey: true }), false);
+});
+
+test("keeps Ctrl and Mod distinct for tab history shortcuts on macOS", () => {
+  const event = { key: "ArrowLeft", ctrlKey: true, altKey: true };
+
+  assert.equal(isNavigateTabHistoryBackShortcut(event, undefined, "MacIntel"), true);
+  assert.equal(isNavigateTabHistoryBackShortcut({ ...event, metaKey: true }, undefined, "MacIntel"), false);
+});
+
+test("matches tab history defaults to the recorded shortcut format on each platform", () => {
+  const backEvent = { key: "ArrowLeft", ctrlKey: true, altKey: true };
+  const forwardEvent = { key: "ArrowRight", ctrlKey: true, altKey: true };
+
+  assert.equal(tabNavigationHistoryDefaultShortcut("back", "Win32"), "Mod+Alt+ArrowLeft");
+  assert.equal(tabNavigationHistoryDefaultShortcut("forward", "Linux x86_64"), "Mod+Alt+ArrowRight");
+  assert.equal(tabNavigationHistoryDefaultShortcut("back", "MacIntel"), "Ctrl+Alt+ArrowLeft");
+  assert.equal(tabNavigationHistoryDefaultShortcut("forward", "MacIntel"), "Ctrl+Alt+ArrowRight");
+  assert.equal(eventToShortcut(backEvent, "Win32"), tabNavigationHistoryDefaultShortcut("back", "Win32"));
+  assert.equal(eventToShortcut(forwardEvent, "Linux x86_64"), tabNavigationHistoryDefaultShortcut("forward", "Linux x86_64"));
+  assert.equal(eventToShortcut(backEvent, "MacIntel"), tabNavigationHistoryDefaultShortcut("back", "MacIntel"));
+  assert.equal(eventToShortcut(forwardEvent, "MacIntel"), tabNavigationHistoryDefaultShortcut("forward", "MacIntel"));
+});
+
+test("reports Ctrl and Mod as equivalent conflicts on Windows/Linux but not macOS", () => {
+  const backShortcut = eventToShortcut({ key: "ArrowLeft", ctrlKey: true, altKey: true }, "Win32")!;
+  const forwardShortcut = eventToShortcut({ key: "ArrowRight", ctrlKey: true, altKey: true }, "Win32")!;
+  const backSettings = { ...DEFAULT_SHORTCUT_SETTINGS, navigateTabHistoryBack: backShortcut, quickOpen: "Ctrl+Alt+ArrowLeft" };
+  const forwardSettings = { ...DEFAULT_SHORTCUT_SETTINGS, navigateTabHistoryForward: forwardShortcut, quickOpen: "Ctrl+Alt+ArrowRight" };
+
+  assert.equal(findShortcutConflict("quickOpen", backShortcut, backSettings, "Win32"), "navigateTabHistoryBack");
+  assert.equal(findShortcutConflict("quickOpen", forwardShortcut, forwardSettings, "Linux x86_64"), "navigateTabHistoryForward");
+  assert.equal(findShortcutConflict("quickOpen", "Mod+Alt+ArrowLeft", { ...DEFAULT_SHORTCUT_SETTINGS, navigateTabHistoryBack: "Ctrl+Alt+ArrowLeft", quickOpen: "Mod+Alt+ArrowLeft" }, "MacIntel"), null);
+});
+
+test("restores the local tab history default format after cross-platform sync", () => {
+  const currentBackDefault = tabNavigationHistoryDefaultShortcut("back");
+  const currentForwardDefault = tabNavigationHistoryDefaultShortcut("forward");
+  const otherBackDefault = currentBackDefault.startsWith("Mod+") ? "Ctrl+Alt+ArrowLeft" : "Mod+Alt+ArrowLeft";
+  const otherForwardDefault = currentForwardDefault.startsWith("Mod+") ? "Ctrl+Alt+ArrowRight" : "Mod+Alt+ArrowRight";
+  const normalized = normalizeShortcutSettings({
+    navigateTabHistoryBack: otherBackDefault,
+    navigateTabHistoryForward: otherForwardDefault,
+  });
+
+  assert.equal(normalized.navigateTabHistoryBack, currentBackDefault);
+  assert.equal(normalized.navigateTabHistoryForward, currentForwardDefault);
+});
+
+test("preserves existing actions and unbinds new history actions when defaults conflict", () => {
+  const normalized = normalizeShortcutSettings({
+    switchToPreviousTab: "Ctrl+Alt+ArrowLeft",
+    switchToNextTab: "Mod+Alt+ArrowRight",
+  });
+
+  assert.equal(normalized.switchToPreviousTab, "Ctrl+Alt+ArrowLeft");
+  assert.equal(normalized.switchToNextTab, "Mod+Alt+ArrowRight");
+  assert.equal(normalized.navigateTabHistoryBack, "");
+  assert.equal(normalized.navigateTabHistoryForward, "");
+});
+
+test("uses platform-aware defaults when migrating legacy shortcut settings", () => {
+  const windows = normalizeShortcutSettings({ switchToPreviousTab: "Ctrl+Alt+ArrowLeft" }, "Win32");
+  const mac = normalizeShortcutSettings({ switchToPreviousTab: "Mod+Alt+ArrowLeft" }, "MacIntel");
+
+  assert.equal(windows.navigateTabHistoryBack, "");
+  assert.equal(mac.navigateTabHistoryBack, "Ctrl+Alt+ArrowLeft");
+});
+
+test("only handles tab history shortcuts when navigation succeeds", () => {
+  const event = { key: "ArrowLeft", ctrlKey: true, altKey: true };
+  const directions: number[] = [];
+  let prevented = false;
+
+  prevented = handleTabHistoryNavigationShortcut(
+    event,
+    undefined,
+    (direction) => {
+      directions.push(direction);
+      return false;
+    },
+    "Win32",
+  );
+  assert.equal(prevented, false);
+  assert.deepEqual(directions, [-1]);
+
+  prevented = handleTabHistoryNavigationShortcut(
+    event,
+    undefined,
+    (direction) => {
+      directions.push(direction);
+      return true;
+    },
+    "Win32",
+  );
+  assert.equal(prevented, true);
+  assert.deepEqual(directions, [-1, -1]);
+});
+
+test("requests tab history migration only when legacy shortcut settings exist", () => {
+  assert.equal(needsTabNavigationHistoryShortcutMigration(), false);
+  assert.equal(needsTabNavigationHistoryShortcutMigration({}), true);
+});
+
+test("adds default bindings for new history actions when legacy shortcuts do not conflict", () => {
+  const normalized = normalizeShortcutSettings({
+    switchToPreviousTab: "Shift+Mod+[",
+    switchToNextTab: "Shift+Mod+]",
+  });
+
+  assert.equal(normalized.navigateTabHistoryBack, tabNavigationHistoryDefaultShortcut("back"));
+  assert.equal(normalized.navigateTabHistoryForward, tabNavigationHistoryDefaultShortcut("forward"));
+});
+
+test("preserves explicitly configured tab history shortcuts during migration", () => {
+  const backShortcut = tabNavigationHistoryDefaultShortcut("back");
+  const normalized = normalizeShortcutSettings({
+    navigateTabHistoryBack: backShortcut,
+    switchToPreviousTab: backShortcut,
+  });
+
+  assert.equal(normalized.navigateTabHistoryBack, backShortcut);
+  assert.equal(normalized.switchToPreviousTab, backShortcut);
+});
+
+test("clears the gotoLine default when an explicit editor binding already owns its key", () => {
+  // Ctrl+G was a legal explicit binding slot before gotoLine adopted it on
+  // Windows/Linux; the user's explicit choice must keep winning over the new
+  // default (which registers earlier in the runtime keymap).
+  const windows = normalizeShortcutSettings({ formatSql: "Ctrl+G" }, "Win32");
+  assert.equal(windows.gotoLine, "");
+  assert.equal(windows.formatSql, "Ctrl+G");
+
+  // macOS defaults (⌘⌥G) never collide, and an explicit gotoLine config wins.
+  const mac = normalizeShortcutSettings({ formatSql: "Ctrl+G" }, "MacIntel");
+  assert.equal(mac.gotoLine, "Mod+Alt+G");
+  const explicit = normalizeShortcutSettings({ gotoLine: "Ctrl+G" }, "Win32");
+  assert.equal(explicit.gotoLine, "Ctrl+G");
 });
 
 test("matches Mod+number for switching to numbered tabs", () => {
@@ -142,6 +296,14 @@ test("matches the platform modifier for closing query tabs", () => {
   assert.equal(isCloseTabShortcut({ key: "w", ctrlKey: true }, { closeTab: "Meta+W" } as any), true);
 });
 
+test("matches the shortcut for closing window", () => {
+  assert.equal(isCloseWindowShortcut({ key: "W", metaKey: true, shiftKey: true }), true);
+  assert.equal(isCloseWindowShortcut({ key: "W", ctrlKey: true, shiftKey: true }), true);
+  assert.equal(isCloseWindowShortcut({ key: "w", metaKey: true, shiftKey: true }), true);
+  assert.equal(isCloseWindowShortcut({ key: "w", ctrlKey: true, shiftKey: true }), true);
+  assert.equal(isCloseWindowShortcut({ key: "q", ctrlKey: true }, { closeWindow: "Mod+Q" }), true);
+});
+
 test("matches platform shortcuts for closing other tabs", () => {
   // macOS 默认 ⌥⌘W：Option 会把 event.key 变形（⌥W → "∑"），按 code 回退匹配。
   // 平台默认集合内的值会被 normalize 按本机平台还原（云同步自愈），因此
@@ -181,6 +343,23 @@ test("matches F5 for refreshing data", () => {
   assert.equal(isRefreshDataShortcut({ key: "F5" }), true);
 });
 
+test("keeps the results pane shortcut unbound until the user configures it", () => {
+  const configured = { toggleResultsPane: "Mod+G" } as any;
+
+  assert.equal(DEFAULT_SHORTCUT_SETTINGS.toggleResultsPane, "");
+  assert.equal(normalizeShortcutSettings({}).toggleResultsPane, "");
+  assert.equal(isToggleResultsPaneShortcut({ key: "g", ctrlKey: true }), false);
+  assert.equal(isToggleResultsPaneShortcut({ key: "g", ctrlKey: true }, configured), true);
+  assert.equal(isToggleResultsPaneShortcut({ key: "g", ctrlKey: true, isComposing: true }, configured), false);
+  assert.equal(isToggleResultsPaneShortcut({ key: "g", ctrlKey: true }, { toggleResultsPane: "" } as any), false);
+});
+
+test("reports conflicts for a configured global results pane shortcut", () => {
+  const shortcuts = { ...DEFAULT_SHORTCUT_SETTINGS, toggleResultsPane: "Mod+F" };
+
+  assert.equal(findShortcutConflict("toggleResultsPane", "Mod+F", shortcuts), "focusSearch");
+});
+
 test("matches configurable shortcut for toggling transpose view", () => {
   assert.equal(isToggleTransposeShortcut({ key: "Tab" }), true);
   assert.equal(isToggleTransposeShortcut({ key: "Tab" }, { toggleTranspose: "Alt+T" } as any), false);
@@ -198,6 +377,19 @@ test("detects browser reload shortcuts for desktop suppression", () => {
   assert.equal(isBrowserReloadShortcut({ key: "F5" }), true);
   assert.equal(isBrowserReloadShortcut({ key: "r", altKey: true, ctrlKey: true }), false);
   assert.equal(isBrowserReloadShortcut({ key: "r", ctrlKey: true, isComposing: true }), false);
+});
+
+test("detects browser task manager shortcut (Shift+Escape) for suppression", () => {
+  assert.equal(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true }), true);
+  assert.equal(isBrowserTaskManagerShortcut({ key: "Esc", shiftKey: true }), true);
+  assert.equal(isBrowserTaskManagerShortcut({ code: "Escape", shiftKey: true, key: "Unidentified" }), true);
+  assert.equal(isBrowserTaskManagerShortcut({ key: "Escape" }), false);
+  assert.equal(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: false }), false);
+  assert.equal(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, ctrlKey: true }), false);
+  assert.equal(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, metaKey: true }), false);
+  assert.equal(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, altKey: true }), false);
+  assert.equal(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, isComposing: true }), false);
+  assert.equal(isBrowserTaskManagerShortcut({ key: "Tab", shiftKey: true }), false);
 });
 
 test("matches Mod-R without shift or alt for scoped refresh and replace", () => {
@@ -240,8 +432,16 @@ test("matches Cmd+S for saving", () => {
   assert.equal(isSaveShortcut({ key: "s", metaKey: true }), true);
 });
 
-test("matches Mod+D for copying current row", () => {
+test("matches copy current row Mod+D by default while honoring custom shortcuts", () => {
   assert.equal(isCopyCurrentRowShortcut({ key: "d", metaKey: true }), true);
+  assert.equal(isCopyCurrentRowShortcut({ key: "d", altKey: true }, { copyCurrentRow: "Alt+D" }), true);
+});
+
+test("matches edit cell F2 by default while honoring custom shortcuts", () => {
+  assert.equal(isEditCellShortcut({ key: "F2" }), true);
+  assert.equal(isEditCellShortcut({ key: "e", ctrlKey: true }, { editCell: "Mod+E" } as any), true);
+  assert.equal(isEditCellShortcut({ key: "F2" }, { editCell: "Mod+E" } as any), false);
+  assert.equal(isEditCellShortcut({ key: "F2", ctrlKey: true }), false);
 });
 
 test("matches Delete for deleting current row", () => {
@@ -288,11 +488,14 @@ test("matches configurable sidebar shortcuts", () => {
   assert.equal(isCopySidebarSelectionShortcut({ key: "c", metaKey: true }), true);
   assert.equal(isPasteSidebarSelectionShortcut({ key: "v", ctrlKey: true }), true);
   assert.equal(isEditSidebarConnectionShortcut({ key: "e", metaKey: true }), true);
+  assert.equal(isDisconnectSidebarConnectionShortcut({ key: "e", metaKey: true, shiftKey: true }), true);
+  assert.equal(isDisconnectSidebarConnectionShortcut({ key: "e", ctrlKey: true, shiftKey: true }), true);
 
   const shortcuts = {
     copySidebarSelection: "Alt+C",
     pasteSidebarSelection: "Alt+V",
     editSidebarConnection: "Shift+Mod+E",
+    disconnectSidebarConnection: "Alt+D",
   } as any;
 
   assert.equal(isCopySidebarSelectionShortcut({ key: "c", metaKey: true }, shortcuts), false);
@@ -300,4 +503,13 @@ test("matches configurable sidebar shortcuts", () => {
   assert.equal(isPasteSidebarSelectionShortcut({ key: "v", altKey: true }, shortcuts), true);
   assert.equal(isEditSidebarConnectionShortcut({ key: "e", metaKey: true }, shortcuts), false);
   assert.equal(isEditSidebarConnectionShortcut({ key: "e", ctrlKey: true, shiftKey: true }, shortcuts), true);
+  assert.equal(isDisconnectSidebarConnectionShortcut({ key: "e", metaKey: true, shiftKey: true }, shortcuts), false);
+  assert.equal(isDisconnectSidebarConnectionShortcut({ key: "d", altKey: true }, shortcuts), true);
+});
+
+test("defaults and normalizes select-line-ends shortcut", () => {
+  const defaults = DEFAULT_SHORTCUT_SETTINGS;
+  assert.equal(defaults.selectLineEnds, "Alt+Shift+I");
+  assert.equal(normalizeShortcutSettings({ selectLineEnds: "Shift+Alt+L" }).selectLineEnds, "Shift+Alt+L");
+  assert.equal(shortcutToCodeMirrorKey(defaults.selectLineEnds), "Alt-Shift-i");
 });

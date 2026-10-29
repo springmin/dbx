@@ -1,7 +1,33 @@
+import type { DatabaseType } from "@/types/database";
 import { isNumericColumnType } from "@/lib/dataGrid/dataGridColumnType";
 
 export type DataGridSortDirection = "asc" | "desc";
 export type DataGridSortMode = "database" | "local";
+
+/**
+ * Cassandra rejects ORDER BY unless the partition key is restricted by an
+ * equality filter, so a browse query can never be sorted database-side there
+ * and the sort would keep failing on every refresh or page jump while applied.
+ */
+export function databaseSortSupportedForDatabase(databaseType?: DatabaseType): boolean {
+  return databaseType !== "cassandra";
+}
+
+/**
+ * Result-column positions of the table's complete primary key, appended to a
+ * database sort so tied rows keep one order across pages and exports. Empty
+ * unless every key column maps to exactly one result column.
+ */
+export function primaryKeyTieBreakerIndexes(sourceColumns: readonly (string | undefined)[] | undefined, primaryKeys: readonly string[] | undefined): number[] {
+  if (!sourceColumns?.length || !primaryKeys?.length) return [];
+  const indexes: number[] = [];
+  for (const primaryKey of primaryKeys) {
+    const matches = sourceColumns.flatMap((column, index) => (column === primaryKey ? [index] : []));
+    if (matches.length !== 1) return [];
+    indexes.push(matches[0]!);
+  }
+  return indexes;
+}
 
 export interface DataGridSortState {
   column: string | null;
@@ -57,7 +83,7 @@ export function nextDataGridSortState(current: DataGridSortState, column: string
   return { column, columnIndex, direction: "asc" };
 }
 
-type DataGridCellValue = string | number | boolean | null | undefined;
+type DataGridCellValue = string | number | bigint | boolean | null | undefined;
 type DataGridRow = DataGridCellValue[];
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
@@ -96,9 +122,21 @@ export function compareDataGridValues(left: DataGridCellValue, right: DataGridCe
   if (typeof left === "number" && typeof right === "number") {
     return compareNumbers(left, right);
   }
+  if (typeof left === "bigint" && typeof right === "bigint") {
+    return compareBigInts(left, right);
+  }
   if (typeof left === "boolean" && typeof right === "boolean") {
     return Number(left) - Number(right);
   }
+
+  // When columnType is not specified (e.g. untyped results, omitted columnType),
+  // if both values represent valid numbers/bigints, compare them numerically so
+  // numeric columns and primary keys do not fall back to string dictionary collation (#13668).
+  if (!columnType) {
+    const numericCompared = compareNumericCellValues(left, right);
+    if (numericCompared !== null) return numericCompared;
+  }
+
   if (typeof left === "string" && typeof right === "string") {
     const leftDate = dateSortValue(left);
     const rightDate = dateSortValue(right);
@@ -131,6 +169,12 @@ function compareNumericCellValues(left: DataGridCellValue, right: DataGridCellVa
 }
 
 function parseNumericSortValue(value: DataGridCellValue): NumericSortValue | null {
+  if (typeof value === "bigint") {
+    if (value === 0n) return { sign: 0, magnitude: 0n, digits: "0" };
+    const sign = value < 0n ? -1 : 1;
+    const unsigned = (sign === -1 ? -value : value).toString();
+    return { sign, magnitude: BigInt(unsigned.length), digits: unsigned };
+  }
   if (typeof value !== "string" && typeof value !== "number") return null;
   const text = String(value).trim();
   const negative = text.startsWith("-");
@@ -173,7 +217,24 @@ function compareNumbers(left: number, right: number): number {
 }
 
 function dateSortValue(value: string): number | null {
-  if (!/^\d{4}-\d{2}-\d{2}/.test(value)) return null;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
+  const trimmed = value.trim();
+  // PostgreSQL and KingbaseES render timestamps as `YYYY-MM-DD HH:MM:SS.ffffff`
+  // (space separator, microsecond precision, optional numeric UTC offset) plus
+  // the special values infinity/-infinity. Date.parse rejects several of those
+  // shapes depending on the engine, silently degrading time columns to
+  // lexicographic order (issue #7281), so parse them deterministically.
+  if (trimmed === "infinity") return Number.MAX_SAFE_INTEGER;
+  if (trimmed === "-infinity") return Number.MIN_SAFE_INTEGER;
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{2}(?::?\d{2})?)?)?/.exec(trimmed);
+  if (!match) return null;
+  const [, year, month, day, hour = "0", minute = "0", second = "0", fraction, zone] = match;
+  let sortValue = Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)) + (fraction ? Number(`0.${fraction}`) * 1000 : 0);
+  if (zone && zone !== "Z") {
+    const zoneMatch = /^([+-])(\d{2}):?(\d{2})?$/.exec(zone);
+    if (zoneMatch) {
+      const offsetMinutes = Number(zoneMatch[2]) * 60 + Number(zoneMatch[3] ?? 0);
+      sortValue -= (zoneMatch[1] === "-" ? -1 : 1) * offsetMinutes * 60_000;
+    }
+  }
+  return Number.isFinite(sortValue) ? sortValue : null;
 }

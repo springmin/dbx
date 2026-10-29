@@ -13,6 +13,7 @@ export interface DiagramJsonSnapshot {
   };
   tables: Array<{
     name: string;
+    schema?: string;
     columns: Array<{
       name: string;
       dataType: string;
@@ -74,6 +75,28 @@ function mermaidCardinality(sourceCardinality: "1" | "N", targetCardinality: "1"
   return "}o--o{";
 }
 
+/** Comments are optional metadata; blank/whitespace-only values export nothing (same rule as the cards, issue #9748). */
+function commentText(value: string | null | undefined): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/**
+ * Escape a DBML note exactly like the official dbml-core exporter: backslashes
+ * are doubled first, then plain values stay single-quoted while values with
+ * single quotes or line breaks switch to triple quotes with `\'` escapes
+ * (https://docs.dbml.org/docs/annotation).
+ */
+function dbmlNote(value: string): string {
+  let escaped = value.replace(/\\/g, "\\\\");
+  if (!/['\n\r]/.test(escaped)) return `'${escaped}'`;
+  return `'''${escaped.replace(/'/g, "\\'").replace(/\r\n/g, "\n")}'''`;
+}
+
+/** Mermaid attribute comments are single-line and cannot contain double quotes (https://mermaid.js.org/syntax/entityRelationshipDiagram.html). */
+function mermaidCommentText(value: string): string {
+  return value.replace(/"/g, "'").replace(/\s+/g, " ").trim();
+}
+
 export function diagramExportFileName(connectionName: string, databaseName: string, mode: "table" | "engineering", format: DiagramExportFormat): string {
   const context = [connectionName, databaseName].map(fileToken).filter(Boolean);
   const modeSuffix = mode === "engineering" ? "engineering-er" : "table-structure";
@@ -95,9 +118,13 @@ export function buildDiagramDbml(tables: DiagramTable[], relationships: DiagramR
       const attrs: string[] = [];
       if (column.is_primary_key) attrs.push("pk");
       if (!column.is_nullable) attrs.push("not null");
+      const columnComment = commentText(column.comment);
+      if (columnComment) attrs.push(`note: ${dbmlNote(columnComment)}`);
       const attrSuffix = attrs.length > 0 ? ` [${attrs.join(", ")}]` : "";
       lines.push(`  ${quoteIdent(column.name)} ${dbmlType(column.data_type)}${attrSuffix}`);
     }
+    const tableComment = commentText(table.comment);
+    if (tableComment) lines.push(`  Note: ${dbmlNote(tableComment)}`);
     lines.push("}", "");
   }
 
@@ -115,11 +142,17 @@ export function buildDiagramMermaid(tables: DiagramTable[], relationships: Diagr
 
   for (const table of tables) {
     const entity = mermaidIdent(table.name);
+    // erDiagram has no entity-level note syntax, so the table comment rides on
+    // a `%%` comment line (comments must sit on their own line) above the block.
+    const tableComment = commentText(table.comment);
+    if (tableComment) lines.push(`  %% ${mermaidCommentText(table.name)}: ${mermaidCommentText(tableComment)}`);
     lines.push(`  ${entity} {`);
     for (const column of table.columns) {
       const typeToken = (column.data_type || "unknown").replace(/\s+/g, "_").replace(/[^A-Za-z0-9_]/g, "") || "unknown";
       const key = column.is_primary_key ? " PK" : "";
-      lines.push(`    ${typeToken} ${mermaidIdent(column.name)}${key}`);
+      const columnComment = commentText(column.comment);
+      const commentSuffix = columnComment ? ` "${mermaidCommentText(columnComment)}"` : "";
+      lines.push(`    ${typeToken} ${mermaidIdent(column.name)}${key}${commentSuffix}`);
     }
     lines.push("  }");
   }
@@ -136,39 +169,76 @@ export function buildDiagramMermaid(tables: DiagramTable[], relationships: Diagr
   return lines.join("\n");
 }
 
+// Browsers cap canvas backing stores: Chromium/WebView2 and WebKit both
+// reject surfaces beyond 16384 px per side (and beyond ~16384² total pixels),
+// in which case rasterization silently fails and `toBlob` yields nothing.
+// Large diagrams at the default 2x scale exceed these limits, so the export
+// scale is clamped to the largest value that still fits (issue #7248).
+export const MAX_PNG_CANVAS_SIDE = 16384;
+export const MAX_PNG_CANVAS_AREA = MAX_PNG_CANVAS_SIDE * MAX_PNG_CANVAS_SIDE;
+// Never downscale below this when retrying failed rasterizations: a heavily
+// reduced PNG is still more useful than a failed export, but beyond this the
+// diagram becomes unreadable.
+export const MIN_PNG_EXPORT_SCALE = 0.05;
+
+export function resolvePngExportScale(width: number, height: number, requestedScale: number): number {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0 || !Number.isFinite(requestedScale) || requestedScale <= 0) {
+    return requestedScale;
+  }
+  const sideScale = Math.min(MAX_PNG_CANVAS_SIDE / width, MAX_PNG_CANVAS_SIDE / height);
+  const areaScale = Math.sqrt(MAX_PNG_CANVAS_AREA / (width * height));
+  // Allow sub-1 scales for oversized diagrams: a lower-resolution PNG beats
+  // a failed export.
+  return Math.min(requestedScale, sideScale, areaScale);
+}
+
 export function svgToPngBlob(svg: string, scale = 2): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const blob = new Blob([svg], { type: "image/svg+xml;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const img = new Image();
     img.onload = () => {
-      try {
-        const width = Math.max(1, Math.ceil(img.naturalWidth * scale));
-        const height = Math.max(1, Math.ceil(img.naturalHeight * scale));
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) {
-          URL.revokeObjectURL(url);
-          reject(new Error("Canvas unsupported"));
-          return;
-        }
-        ctx.fillStyle = "#fafafa";
-        ctx.fillRect(0, 0, width, height);
-        ctx.drawImage(img, 0, 0, width, height);
-        URL.revokeObjectURL(url);
-        canvas.toBlob((png) => {
-          if (!png) {
-            reject(new Error("PNG encode failed"));
+      // Device-dependent caps (GPU texture limits, available memory) can be
+      // far below the documented canvas limits, and a failed rasterization
+      // only surfaces as a null blob. Try the clamped scale first, then keep
+      // halving it instead of failing the export outright (issue #7248).
+      const initialScale = Math.max(resolvePngExportScale(img.naturalWidth, img.naturalHeight, scale), MIN_PNG_EXPORT_SCALE);
+      const rasterize = (attemptScale: number): void => {
+        try {
+          const width = Math.max(1, Math.ceil(img.naturalWidth * attemptScale));
+          const height = Math.max(1, Math.ceil(img.naturalHeight * attemptScale));
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) {
+            URL.revokeObjectURL(url);
+            reject(new Error("Canvas unsupported"));
             return;
           }
-          resolve(png);
-        }, "image/png");
-      } catch (err) {
-        URL.revokeObjectURL(url);
-        reject(err);
-      }
+          ctx.fillStyle = "#fafafa";
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+          canvas.toBlob((png) => {
+            if (png) {
+              URL.revokeObjectURL(url);
+              resolve(png);
+              return;
+            }
+            const nextScale = attemptScale / 2;
+            if (nextScale < MIN_PNG_EXPORT_SCALE) {
+              URL.revokeObjectURL(url);
+              reject(new Error(`PNG encode failed for ${width}x${height} canvas`));
+              return;
+            }
+            rasterize(nextScale);
+          }, "image/png");
+        } catch (err) {
+          URL.revokeObjectURL(url);
+          reject(err);
+        }
+      };
+      rasterize(initialScale);
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);

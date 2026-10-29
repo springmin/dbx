@@ -1,4 +1,7 @@
 import type { DatabaseType } from "@/types/database";
+import { collectSqlDatabaseLinkStarts } from "@/lib/sql/sqlDatabaseLinks";
+import { isOracleSubstitutionDatabase } from "@/lib/sql/sqlVariableSyntax";
+import { tokenizeSqlSemantic } from "@/lib/sql/semantic/tokens";
 
 export type SqlParameterValueKind = "string" | "number" | "boolean" | "null" | "raw";
 
@@ -7,7 +10,7 @@ export interface SqlParameterInput {
   value: string;
 }
 
-export type SqlParameterSyntax = "positional" | "named" | "shell" | "mybatis" | "sqlserver";
+export type SqlParameterSyntax = "positional" | "named" | "shell" | "bracketed-shell" | "mybatis" | "sqlserver" | "substitution";
 
 export interface SqlParameterDescriptor {
   key: string;
@@ -25,8 +28,13 @@ export interface SqlBracedParameter extends SqlParameterDescriptor {
 interface ParameterOccurrence extends SqlParameterDescriptor {
   start: number;
   end: number;
-  replacement?: "string-fragment" | "mybatis-foreach";
+  replacement?: "string-fragment" | "quoted-string" | "mybatis-foreach" | "mybatis-where";
   foreach?: MyBatisForeach;
+  where?: MyBatisWhere;
+}
+
+interface MyBatisWhere {
+  body: string;
 }
 
 interface MyBatisForeach {
@@ -50,6 +58,8 @@ type TriggerPseudoRecordName = "new" | "old" | "parent" | "eventinfo";
 
 export interface SqlParameterOptions {
   databaseType?: DatabaseType;
+  /** Database-level compatibility mode, for example openGauss A/B/C/PG. */
+  compatibilityMode?: string;
   // Which placeholder syntaxes are recognized. Undefined enables all of them.
   enabledSyntaxes?: readonly SqlParameterSyntax[];
 }
@@ -61,6 +71,34 @@ const SQL_SERVER_TEMP_TABLE_CONTEXT_KEYWORDS = new Set(["table", "from", "join",
 const MYSQL_ROUTINE_LABEL_STATEMENTS = new Set(["begin", "loop", "while", "repeat"]);
 const MYSQL_ROUTINE_LABEL_CONTEXTS = new Set(["begin", "then", "else", "do", "loop", "repeat"]);
 const MYSQL_ROUTINE_LABEL_RE = /(?:`(?:``|[^`])+`|[\p{L}_][\p{L}\p{N}_]*)$/u;
+const MYSQL_ROUTINE_BODY_STATEMENTS = new Set(["begin", "return", "select", "set", "insert", "update", "delete", "replace", "call", "if", "case", "loop", "while", "repeat", "declare", "do", "leave", "iterate", "signal", "resignal", "get", "fetch"]);
+// These header words cannot be unquoted stored-program labels.
+const MYSQL_ROUTINE_HEADER_KEYWORDS = new Set([
+  "comment",
+  "language",
+  "contains",
+  "no",
+  "reads",
+  "modifies",
+  "not",
+  "deterministic",
+  "sql",
+  "charset",
+  "character",
+  "collate",
+  "binary",
+  "ascii",
+  "unicode",
+  "byte",
+  "signed",
+  "unsigned",
+  "zerofill",
+  "precision",
+  "varying",
+  "char",
+  "varchar",
+  "varbinary",
+]);
 const POSTGRES_QUESTION_PARAMETER_PREFIX_KEYWORDS = new Set([
   "all",
   "and",
@@ -176,6 +214,10 @@ export function extractSqlParameterDescriptors(sql: string, options?: SqlParamet
     descriptors.push(descriptor);
   };
   for (const occurrence of findSqlParameterOccurrences(sql, options)) {
+    if (occurrence.replacement === "mybatis-where" && occurrence.where) {
+      for (const nested of extractSqlParameterDescriptors(occurrence.where.body, options)) appendDescriptor(nested);
+      continue;
+    }
     appendDescriptor({
       key: occurrence.key,
       name: occurrence.name,
@@ -201,19 +243,39 @@ export function substituteSqlParameters(sql: string, values: Record<string, SqlP
   let cursor = 0;
   for (const occurrence of occurrences) {
     result += sql.slice(cursor, occurrence.start);
+    if (occurrence.replacement === "mybatis-where" && occurrence.where) {
+      result += renderMyBatisWhere(occurrence.where, values, options);
+      cursor = occurrence.end;
+      continue;
+    }
     const input = values[occurrence.key] ?? { kind: "string", value: "" };
     if (occurrence.replacement === "mybatis-foreach" && occurrence.foreach) {
       result += renderMyBatisForeach(occurrence.foreach, input, values, options);
       cursor = occurrence.end;
       continue;
     }
+    // An empty Raw SQL value means that this placeholder is intentionally left
+    // unresolved, rather than replaced with an empty string or NULL.
+    if (input.kind === "raw" && !input.value.trim()) {
+      result += occurrence.token;
+      cursor = occurrence.end;
+      continue;
+    }
     // Embedded placeholders stay inside the surrounding SQL string, so their value
     // must be escaped as text instead of being wrapped in a second SQL literal.
-    result += occurrence.replacement === "string-fragment" ? sqlParameterStringFragment(input) : sqlParameterLiteral(input);
+    result += occurrence.replacement === "string-fragment" ? sqlParameterStringFragment(input) : occurrence.replacement === "quoted-string" ? sqlParameterQuotedString(input) : sqlParameterLiteral(input);
     cursor = occurrence.end;
   }
   result += sql.slice(cursor);
-  return decodeMyBatisEntities ? decodeMyBatisXmlComparisonEntities(result) : result;
+  return decodeMyBatisEntities ? decodeMyBatisXmlComparisonEntities(result, options?.databaseType) : result;
+}
+
+const MYBATIS_WHERE_LEADING_CONJUNCTION_RE = /^(?:AND|OR)\s+/i;
+
+function renderMyBatisWhere(where: MyBatisWhere, values: Record<string, SqlParameterInput>, options?: SqlParameterOptions): string {
+  const body = substituteSqlParameters(where.body, values, options).trim();
+  if (!body) return "";
+  return `WHERE ${body.replace(MYBATIS_WHERE_LEADING_CONJUNCTION_RE, "")}`;
 }
 
 function renderMyBatisForeach(foreach: MyBatisForeach, input: SqlParameterInput, values: Record<string, SqlParameterInput>, options?: SqlParameterOptions): string {
@@ -283,7 +345,7 @@ function unquoteListValue(value: string): string {
   }
 }
 
-function decodeMyBatisXmlComparisonEntities(sql: string): string {
+function decodeMyBatisXmlComparisonEntities(sql: string, databaseType?: DatabaseType): string {
   let result = "";
   let cursor = 0;
   let i = 0;
@@ -293,11 +355,11 @@ function decodeMyBatisXmlComparisonEntities(sql: string): string {
     const next = sql[i + 1];
 
     if (ch === "'" || ch === '"' || ch === "`") {
-      i = skipQuoted(sql, i, ch);
+      i = skipQuoted(sql, i, ch, databaseType);
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -345,16 +407,26 @@ export function sqlParameterLiteral(input: SqlParameterInput): string {
 
 function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions): ParameterOccurrence[] {
   const occurrences: ParameterOccurrence[] = [];
-  const nativeSqlServerParameters = collectNativeSqlServerParameters(sql);
-  const supportsNamedParameters = options?.databaseType !== "saphana";
+  const databaseType = options?.databaseType;
+  const nativeSqlServerParameters = collectNativeSqlServerParameters(sql, databaseType);
+  const supportsNamedParameters = databaseType !== "saphana" && databaseType !== "neo4j" && databaseType !== "nebula";
   const enabledSyntaxes = options?.enabledSyntaxes ? new Set(options.enabledSyntaxes) : null;
-  const isSyntaxEnabled = (syntax: SqlParameterSyntax) => !enabledSyntaxes || enabledSyntaxes.has(syntax);
-  const complexTypeFieldSeparators = supportsNamedParameters && isSyntaxEnabled("named") ? collectComplexTypeFieldSeparators(sql) : new Set<number>();
-  const duckDbStructFieldSeparators = supportsNamedParameters && isSyntaxEnabled("named") && options?.databaseType === "duckdb" ? collectDuckDbStructFieldSeparators(sql) : new Set<number>();
-  const triggerPseudoRecordFieldStarts = supportsNamedParameters && isSyntaxEnabled("named") ? collectTriggerPseudoRecordFieldStarts(sql, options?.databaseType) : new Set<number>();
+  const isSyntaxEnabled = (syntax: SqlParameterSyntax) => {
+    if (enabledSyntaxes) return enabledSyntaxes.has(syntax);
+    if (syntax === "substitution") {
+      return isOracleSubstitutionDatabase(databaseType, options?.compatibilityMode);
+    }
+    return true;
+  };
+  const databaseLinkStarts = isSyntaxEnabled("sqlserver") ? collectSqlDatabaseLinkStarts(sql, databaseType) : new Set<number>();
+  const complexTypeFieldSeparators = supportsNamedParameters && isSyntaxEnabled("named") ? collectComplexTypeFieldSeparators(sql, databaseType) : new Set<number>();
+  const duckDbStructFieldSeparators = supportsNamedParameters && isSyntaxEnabled("named") && databaseType === "duckdb" ? collectDuckDbStructFieldSeparators(sql) : new Set<number>();
+  const triggerPseudoRecordFieldStarts = supportsNamedParameters && isSyntaxEnabled("named") ? collectTriggerPseudoRecordFieldStarts(sql, databaseType) : new Set<number>();
   let i = 0;
   let dollarQuoteEnd = "";
   let positionalIndex = 0;
+  let parenthesisDepth = 0;
+  const postgresBracketStack: Array<{ constructor: boolean; parenthesisDepth: number }> = [];
 
   while (i < sql.length) {
     if (dollarQuoteEnd) {
@@ -369,7 +441,7 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
     const next = sql[i + 1];
 
     if (ch === "<" && isSyntaxEnabled("mybatis")) {
-      const foreach = readMyBatisForeachAt(sql, i);
+      const foreach = readMyBatisForeachAt(sql, i, databaseType);
       if (foreach) {
         occurrences.push({
           key: foreach.collection,
@@ -385,18 +457,39 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
         i = foreach.end;
         continue;
       }
+      const where = readMyBatisWhereAt(sql, i, databaseType);
+      if (where) {
+        occurrences.push({
+          key: "",
+          name: "",
+          syntax: "mybatis",
+          token: "<where>",
+          replacement: "mybatis-where",
+          where: { body: where.body },
+          start: i,
+          end: where.end,
+        });
+        i = where.end;
+        continue;
+      }
     }
 
     if (ch === "'" || ch === '"') {
-      // Exact quoted placeholders use SQL-literal replacement; embedded placeholders
-      // in ordinary single-quoted values use escaped text replacement below.
-      const quoted = tryReadQuotedBracedPlaceholder(sql, i, ch as "'" | '"', isSyntaxEnabled);
+      const quoted = tryReadQuotedBracedPlaceholder(sql, i, ch, isSyntaxEnabled);
       if (quoted) {
         occurrences.push(quoted);
         i = quoted.end;
         continue;
       }
-      const quotedEnd = skipQuoted(sql, i, ch);
+      if (ch === "'" && isSyntaxEnabled("substitution")) {
+        const quotedSubstitution = tryReadQuotedSubstitutionPlaceholder(sql, i, databaseType);
+        if (quotedSubstitution) {
+          occurrences.push(quotedSubstitution);
+          i = quotedSubstitution.end;
+          continue;
+        }
+      }
+      const quotedEnd = skipQuoted(sql, i, ch, databaseType);
       // Double quotes can delimit identifiers, so only ordinary single-quoted
       // values opt into embedded interpolation.
       if (ch === "'" && !hasSqlStringLiteralPrefix(sql, i)) {
@@ -409,8 +502,47 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
       i = skipQuoted(sql, i, ch);
       continue;
     }
+    if (databaseType === "postgres" && ch === "(") {
+      parenthesisDepth += 1;
+      i += 1;
+      continue;
+    }
+    if (databaseType === "postgres" && ch === ")") {
+      parenthesisDepth = Math.max(0, parenthesisDepth - 1);
+      i += 1;
+      continue;
+    }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      if (isSyntaxEnabled("bracketed-shell") && sql.startsWith("${", i + 1)) {
+        const bracketed = tryReadBracketedShellPlaceholder(sql, i);
+        if (bracketed) {
+          occurrences.push(bracketed);
+          i = bracketed.end;
+          continue;
+        }
+        // A failed bracketed-shell candidate must never swallow characters:
+        // treat "[" as a plain character so the inner `${...}` is still picked
+        // up by the shell branch below. Postgres keeps its array-bracket
+        // tracking so `:` slice handling stays intact.
+        if (databaseType !== "postgres") {
+          i += 1;
+          continue;
+        }
+      }
+      if (databaseType === "postgres") {
+        postgresBracketStack.push({
+          constructor: isPostgresArrayConstructorBracket(sql, i, postgresBracketStack[postgresBracketStack.length - 1]?.constructor ?? false),
+          parenthesisDepth,
+        });
+        i += 1;
+        continue;
+      }
+      i = skipBracketIdentifier(sql, i, databaseType);
+      continue;
+    }
+    if (databaseType === "postgres" && ch === "]") {
+      postgresBracketStack.pop();
+      i += 1;
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -440,6 +572,7 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
         sql[i + 1] !== "=" &&
         !complexTypeFieldSeparators.has(i) &&
         !duckDbStructFieldSeparators.has(i) &&
+        !isPostgresSliceSeparator(postgresBracketStack, parenthesisDepth) &&
         !isDuckDbCompactPrefixAliasSeparator(sql, i, options?.databaseType) &&
         !triggerPseudoRecordFieldStarts.has(i) &&
         !isMysqlRoutineLabelSeparator(sql, i, name, options?.databaseType)
@@ -470,7 +603,7 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
     }
     if (ch === "@" && isSyntaxEnabled("sqlserver")) {
       const name = readParameterName(sql, i + 1);
-      if (name && next !== "@" && sql[i - 1] !== "@" && !isOracleDatabaseLinkMarker(sql, i, options?.databaseType) && !isJdbcxMcpScopedPackage(sql, i, i + 1 + name.length) && !nativeSqlServerParameters.declared.has(name.toLowerCase()) && !nativeSqlServerParameters.ignoredStarts.has(i)) {
+      if (name && next !== "@" && sql[i - 1] !== "@" && !databaseLinkStarts.has(i) && !isJdbcxMcpScopedPackage(sql, i, i + 1 + name.length) && !nativeSqlServerParameters.declared.has(name.toLowerCase()) && !nativeSqlServerParameters.ignoredStarts.has(i)) {
         occurrences.push({
           key: name,
           name,
@@ -480,6 +613,14 @@ function findSqlParameterOccurrences(sql: string, options?: SqlParameterOptions)
           end: i + 1 + name.length,
         });
         i += 1 + name.length;
+        continue;
+      }
+    }
+    if (ch === "&" && isSyntaxEnabled("substitution")) {
+      const occurrence = readSubstitutionParameterOccurrence(sql, i);
+      if (occurrence) {
+        occurrences.push(occurrence);
+        i = occurrence.end;
         continue;
       }
     }
@@ -504,10 +645,40 @@ function isMysqlRoutineLabelSeparator(sql: string, colonIndex: number, following
   if (!label) return false;
   const labelStart = colonIndex - label[0].length;
   const prefix = sql.slice(0, labelStart).trimEnd();
-  return prefix.length === 0 || prefix.endsWith(";") || MYSQL_ROUTINE_LABEL_CONTEXTS.has(previousKeyword(sql, labelStart));
+  if (prefix.length === 0 || prefix.endsWith(";") || MYSQL_ROUTINE_LABEL_CONTEXTS.has(previousKeyword(sql, labelStart))) return true;
+  const labelName = label[0].toLowerCase();
+  return !MYSQL_ROUTINE_BODY_STATEMENTS.has(labelName) && isMysqlRoutineHeader(prefix, labelName);
 }
 
-function readMyBatisForeachAt(sql: string, start: number): { collection: string; render: MyBatisForeach; end: number } | null {
+function isMysqlRoutineHeader(sql: string, labelName: string): boolean {
+  if (MYSQL_ROUTINE_HEADER_KEYWORDS.has(labelName)) return false;
+  const tokens = tokenizeSqlSemantic(sql, "mysql", { mysqlBackslashEscape: true, mysqlDoubleQuoteIsString: true }).filter((token) => token.kind !== "comment");
+  let start = tokens.length - 1;
+  while (start >= 0 && tokens[start].text !== ";" && !(tokens[start].kind === "word" && tokens[start].normalized === "create")) start -= 1;
+  if (start < 0 || tokens[start].normalized !== "create") return false;
+
+  const header = tokens.slice(start + 1);
+  const routineIndex = header.findIndex((token) => token.kind === "word" && token.depth === 0 && (token.normalized === "procedure" || token.normalized === "function"));
+  if (routineIndex < 0 || (routineIndex !== 0 && header[0]?.normalized !== "definer")) return false;
+  const parameterStart = header.findIndex((token, index) => index > routineIndex && token.text === "(");
+  if (parameterStart < 0) return false;
+  const parameterEnd = header.findIndex((token, index) => index > parameterStart && token.text === ")" && token.depth === 0);
+  if (parameterEnd < 0) return false;
+
+  // The outer label follows the signature and optional routine characteristics,
+  // before any body statement. Quoted names/comments must not change that context.
+  // The word after RETURNS is a data type, which can itself be SET.
+  const characteristics = header.slice(parameterEnd + 1);
+  // RETURNS and SECURITY can be labels, except where the header expects their values.
+  if (labelName === "returns" && header[routineIndex].normalized === "function" && !characteristics.some((token) => token.kind === "word" && token.depth === 0 && token.normalized === "returns")) return false;
+  const lastKeyword = characteristics[characteristics.length - 1]?.normalized;
+  const previousKeyword = characteristics[characteristics.length - 2]?.normalized;
+  if (lastKeyword === "returns" || lastKeyword === "charset" || lastKeyword === "collate" || (lastKeyword === "security" && previousKeyword === "sql")) return false;
+  if (lastKeyword === "sql" && !["language", "no", "contains"].includes(previousKeyword ?? "")) return false;
+  return !characteristics.some((token, index) => token.kind === "word" && token.depth === 0 && MYSQL_ROUTINE_BODY_STATEMENTS.has(token.normalized) && characteristics[index - 1]?.normalized !== "returns");
+}
+
+function readMyBatisForeachAt(sql: string, start: number, databaseType?: DatabaseType): { collection: string; render: MyBatisForeach; end: number } | null {
   if (!/^<foreach(?:\s|>)/i.test(sql.slice(start))) return null;
   const openingEnd = findXmlTagEnd(sql, start);
   if (openingEnd === -1) return null;
@@ -519,7 +690,7 @@ function readMyBatisForeachAt(sql: string, start: number): { collection: string;
   const index = attributes.get("index")?.trim();
   if (!PARAMETER_NAME_RE.test(collection) || !PARAMETER_NAME_RE.test(item) || (index !== undefined && !PARAMETER_NAME_RE.test(index))) return null;
 
-  const close = findMatchingForeachClose(sql, openingEnd + 1);
+  const close = findMatchingXmlTagClose(sql, openingEnd + 1, "foreach", databaseType);
   if (!close) return null;
   return {
     collection,
@@ -533,6 +704,16 @@ function readMyBatisForeachAt(sql: string, start: number): { collection: string;
     },
     end: close.end,
   };
+}
+
+function readMyBatisWhereAt(sql: string, start: number, databaseType?: DatabaseType): { body: string; end: number } | null {
+  if (!/^<where(?:\s|>)/i.test(sql.slice(start))) return null;
+  const openingEnd = findXmlTagEnd(sql, start);
+  if (openingEnd === -1) return null;
+
+  const close = findMatchingXmlTagClose(sql, openingEnd + 1, "where", databaseType);
+  if (!close) return null;
+  return { body: sql.slice(openingEnd + 1, close.start), end: close.end };
 }
 
 function findXmlTagEnd(source: string, start: number): number {
@@ -577,7 +758,7 @@ function decodeXmlAttribute(value: string): string {
   return value.replace(/&(?:lt|gt|amp|quot|apos);/g, (entity) => ({ "&lt;": "<", "&gt;": ">", "&amp;": "&", "&quot;": '"', "&apos;": "'" })[entity] ?? entity);
 }
 
-function findMatchingForeachClose(sql: string, start: number): { start: number; end: number } | null {
+function findMatchingXmlTagClose(sql: string, start: number, tagName: string, databaseType?: DatabaseType): { start: number; end: number } | null {
   let depth = 1;
   let i = start;
 
@@ -586,11 +767,11 @@ function findMatchingForeachClose(sql: string, start: number): { start: number; 
     const next = sql[i + 1];
 
     if (ch === "'" || ch === '"' || ch === "`") {
-      i = skipQuoted(sql, i, ch);
+      i = skipQuoted(sql, i, ch, databaseType);
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -614,7 +795,7 @@ function findMatchingForeachClose(sql: string, start: number): { start: number; 
       }
     }
     if (ch === "<") {
-      const tag = readForeachTagAt(sql, i);
+      const tag = readXmlTagAt(sql, i, tagName);
       if (tag) {
         depth += tag.closing ? -1 : 1;
         if (depth === 0) return { start: i, end: tag.end };
@@ -627,11 +808,11 @@ function findMatchingForeachClose(sql: string, start: number): { start: number; 
   return null;
 }
 
-function readForeachTagAt(sql: string, start: number): { closing: boolean; end: number } | null {
+function readXmlTagAt(sql: string, start: number, tagName: string): { closing: boolean; end: number } | null {
   const closing = sql[start + 1] === "/";
   const nameStart = start + (closing ? 2 : 1);
-  if (sql.slice(nameStart, nameStart + "foreach".length).toLowerCase() !== "foreach") return null;
-  const boundary = sql[nameStart + "foreach".length];
+  if (sql.slice(nameStart, nameStart + tagName.length).toLowerCase() !== tagName) return null;
+  const boundary = sql[nameStart + tagName.length];
   if (boundary !== ">" && !/\s/.test(boundary ?? "")) return null;
   const tagEnd = findXmlTagEnd(sql, start);
   return tagEnd === -1 ? null : { closing, end: tagEnd + 1 };
@@ -641,12 +822,6 @@ function isDuckDbCompactPrefixAliasSeparator(sql: string, index: number, databas
   if (databaseType !== "duckdb") return false;
   const previous = sql[index - 1] ?? "";
   return PARAMETER_NAME_CHAR_RE.test(previous) || previous === '"';
-}
-
-function isOracleDatabaseLinkMarker(sql: string, index: number, databaseType: DatabaseType | undefined): boolean {
-  if (databaseType !== "oracle" || index === 0) return false;
-  const previous = sql[index - 1];
-  return PARAMETER_NAME_CHAR_RE.test(previous) || previous === "$" || previous === "#" || previous === '"';
 }
 
 function isPostgresQuestionMarkOperator(sql: string, index: number, databaseType: DatabaseType | undefined): boolean {
@@ -791,7 +966,7 @@ function readDuckDbStructFieldSeparator(sql: string, start: number): number | nu
   return sql[separator] === ":" ? separator : null;
 }
 
-// Oracle and Dameng expose trigger rows through colon-prefixed pseudo-records,
+// Oracle, OceanBase Oracle and Dameng expose trigger rows through colon-prefixed pseudo-records,
 // unlike PostgreSQL's unprefixed NEW/OLD records. Keep ordinary :name binds enabled.
 function collectTriggerPseudoRecordFieldStarts(sql: string, databaseType?: DatabaseType): Set<number> {
   const starts = new Set<number>();
@@ -814,11 +989,11 @@ function collectTriggerPseudoRecordFieldStarts(sql: string, databaseType?: Datab
     const ch = sql[i];
     const next = sql[i + 1];
     if (ch === "'" || ch === '"' || ch === "`") {
-      i = skipQuoted(sql, i, ch);
+      i = skipQuoted(sql, i, ch, databaseType);
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -874,7 +1049,7 @@ function collectTriggerPseudoRecordFieldStarts(sql: string, databaseType?: Datab
 }
 
 function triggerPseudoRecordDefaults(databaseType?: DatabaseType): readonly TriggerPseudoRecordName[] | null {
-  if (databaseType === "oracle") return ["new", "old", "parent"];
+  if (databaseType === "oracle" || databaseType === "oceanbase-oracle") return ["new", "old", "parent"];
   if (databaseType === "dameng") return ["new", "old", "eventinfo"];
   return null;
 }
@@ -951,7 +1126,7 @@ function isJdbcxMcpScopedPackage(sql: string, start: number, nameEnd: number): b
 }
 
 // Doris-style complex types use colons between field names and types; those are not bind parameters.
-function collectComplexTypeFieldSeparators(sql: string): Set<number> {
+function collectComplexTypeFieldSeparators(sql: string, databaseType?: DatabaseType): Set<number> {
   const separators = new Set<number>();
   let i = 0;
   let dollarQuoteEnd = "";
@@ -972,7 +1147,7 @@ function collectComplexTypeFieldSeparators(sql: string): Set<number> {
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -997,7 +1172,7 @@ function collectComplexTypeFieldSeparators(sql: string): Set<number> {
     }
     const declaration = readComplexTypeDeclaration(sql, i);
     if (declaration) {
-      i = collectComplexTypeFieldSeparatorsInDeclaration(sql, declaration.openingBracket + 1, declaration.kind, separators) + 1;
+      i = collectComplexTypeFieldSeparatorsInDeclaration(sql, declaration.openingBracket + 1, declaration.kind, separators, databaseType) + 1;
       continue;
     }
     i += 1;
@@ -1006,7 +1181,7 @@ function collectComplexTypeFieldSeparators(sql: string): Set<number> {
   return separators;
 }
 
-function collectComplexTypeFieldSeparatorsInDeclaration(sql: string, start: number, kind: ComplexTypeDeclarationKind, separators: Set<number>): number {
+function collectComplexTypeFieldSeparatorsInDeclaration(sql: string, start: number, kind: ComplexTypeDeclarationKind, separators: Set<number>, databaseType?: DatabaseType): number {
   let i = start;
   let genericDepth = 0;
   let parenthesisDepth = 0;
@@ -1020,7 +1195,7 @@ function collectComplexTypeFieldSeparatorsInDeclaration(sql: string, start: numb
         continue;
       }
       if (isLineStatementStart(sql, i) && isSqlStatementKeyword(sql, i)) return i;
-      const fieldNameEnd = readComplexTypeFieldNameEnd(sql, i, kind);
+      const fieldNameEnd = readComplexTypeFieldNameEnd(sql, i, kind, databaseType);
       if (fieldNameEnd > i) {
         const separator = skipSqlWhitespaceAndComments(sql, fieldNameEnd);
         if (sql[separator] === ":") {
@@ -1042,7 +1217,7 @@ function collectComplexTypeFieldSeparatorsInDeclaration(sql: string, start: numb
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -1059,7 +1234,7 @@ function collectComplexTypeFieldSeparatorsInDeclaration(sql: string, start: numb
     }
     const declaration = readComplexTypeDeclaration(sql, i);
     if (declaration) {
-      i = collectComplexTypeFieldSeparatorsInDeclaration(sql, declaration.openingBracket + 1, declaration.kind, separators) + 1;
+      i = collectComplexTypeFieldSeparatorsInDeclaration(sql, declaration.openingBracket + 1, declaration.kind, separators, databaseType) + 1;
       continue;
     }
     if (ch === ";" && genericDepth === 0 && parenthesisDepth === 0) return i;
@@ -1101,12 +1276,12 @@ function readComplexTypeDeclaration(sql: string, start: number): { kind: Complex
   return sql[openingBracket] === "<" ? { kind, openingBracket } : null;
 }
 
-function readComplexTypeFieldNameEnd(sql: string, start: number, kind: ComplexTypeDeclarationKind): number {
+function readComplexTypeFieldNameEnd(sql: string, start: number, kind: ComplexTypeDeclarationKind, databaseType?: DatabaseType): number {
   if (kind === "variant") return readVariantFieldNameEnd(sql, start);
 
   const ch = sql[start];
   if (ch === '"' || ch === "`") return skipQuoted(sql, start, ch);
-  if (ch === "[") return skipBracketIdentifier(sql, start);
+  if (ch === "[") return skipBracketIdentifier(sql, start, databaseType);
   if (!PARAMETER_NAME_START_RE.test(ch ?? "")) return start;
 
   let i = start + 1;
@@ -1142,7 +1317,7 @@ function skipSqlWhitespaceAndComments(sql: string, start: number): number {
   return i;
 }
 
-function collectNativeSqlServerParameters(sql: string): { declared: Set<string>; ignoredStarts: Set<number> } {
+function collectNativeSqlServerParameters(sql: string, databaseType?: DatabaseType): { declared: Set<string>; ignoredStarts: Set<number> } {
   const declared = new Set<string>();
   const ignoredStarts = new Set<number>();
   let i = 0;
@@ -1164,7 +1339,7 @@ function collectNativeSqlServerParameters(sql: string): { declared: Set<string>;
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -1188,23 +1363,30 @@ function collectNativeSqlServerParameters(sql: string): { declared: Set<string>;
       continue;
     }
     if (matchesWord(sql, i, "declare")) {
-      i = collectDeclareStatementVariables(sql, i + "declare".length, declared);
+      i = collectDeclareStatementVariables(sql, i + "declare".length, declared, databaseType);
       continue;
     }
     if (matchesWord(sql, i, "set")) {
-      i = collectSetStatementVariables(sql, i + "set".length, declared);
+      i = collectSetStatementVariables(sql, i + "set".length, declared, databaseType);
       continue;
     }
     if (matchesWord(sql, i, "select")) {
-      i = collectSelectAssignmentVariables(sql, i + "select".length, declared);
+      i = collectSelectAssignmentVariables(sql, i + "select".length, declared, databaseType);
       continue;
     }
+    if (matchesWord(sql, i, "get")) {
+      const diagnosticsEnd = readGetDiagnosticsEnd(sql, i);
+      if (diagnosticsEnd !== null) {
+        i = collectSetStatementVariables(sql, diagnosticsEnd, declared, databaseType);
+        continue;
+      }
+    }
     if ((matchesWord(sql, i, "create") || matchesWord(sql, i, "alter")) && isRoutineDefinitionStart(sql, i)) {
-      i = collectRoutineDefinitionVariables(sql, i, declared);
+      i = collectRoutineDefinitionVariables(sql, i, declared, databaseType);
       continue;
     }
     if (matchesWord(sql, i, "exec") || matchesWord(sql, i, "execute")) {
-      i = collectExecNamedArgumentStarts(sql, i + (matchesWord(sql, i, "exec") ? "exec".length : "execute".length), ignoredStarts);
+      i = collectExecNamedArgumentStarts(sql, i + (matchesWord(sql, i, "exec") ? "exec".length : "execute".length), ignoredStarts, databaseType);
       continue;
     }
     i += 1;
@@ -1213,7 +1395,7 @@ function collectNativeSqlServerParameters(sql: string): { declared: Set<string>;
   return { declared, ignoredStarts };
 }
 
-function collectDeclareStatementVariables(sql: string, start: number, declared: Set<string>): number {
+function collectDeclareStatementVariables(sql: string, start: number, declared: Set<string>, databaseType?: DatabaseType): number {
   let i = start;
   while (i < sql.length) {
     const ch = sql[i];
@@ -1225,7 +1407,7 @@ function collectDeclareStatementVariables(sql: string, start: number, declared: 
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -1253,7 +1435,7 @@ function collectDeclareStatementVariables(sql: string, start: number, declared: 
   return i;
 }
 
-function collectSetStatementVariables(sql: string, start: number, declared: Set<string>): number {
+function collectSetStatementVariables(sql: string, start: number, declared: Set<string>, databaseType?: DatabaseType): number {
   let i = start;
   while (i < sql.length) {
     const ch = sql[i];
@@ -1265,7 +1447,7 @@ function collectSetStatementVariables(sql: string, start: number, declared: Set<
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -1293,20 +1475,21 @@ function collectSetStatementVariables(sql: string, start: number, declared: Set<
   return i;
 }
 
-function collectSelectAssignmentVariables(sql: string, start: number, declared: Set<string>): number {
+function collectSelectAssignmentVariables(sql: string, start: number, declared: Set<string>, databaseType?: DatabaseType): number {
   let i = start;
+  let depth = 0;
   while (i < sql.length) {
     const ch = sql[i];
     const next = sql[i + 1];
-    if (ch === ";") return i + 1;
-    if (isLineStatementStart(sql, i) && isSqlStatementKeyword(sql, i)) return i;
-    if (matchesWord(sql, i, "from")) return i;
+    if (ch === ";" && depth === 0) return i + 1;
+    if (depth === 0 && isLineStatementStart(sql, i) && isSqlStatementKeyword(sql, i)) return i;
+    if (databaseType !== "mysql" && matchesWord(sql, i, "from")) return i;
     if (ch === "'" || ch === '"' || ch === "`") {
       i = skipQuoted(sql, i, ch);
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -1321,6 +1504,23 @@ function collectSelectAssignmentVariables(sql: string, start: number, declared: 
       i = skipLine(sql, i + 1);
       continue;
     }
+    if (databaseType === "mysql" && ch === "(") {
+      depth += 1;
+      i += 1;
+      continue;
+    }
+    if (databaseType === "mysql" && ch === ")") {
+      depth = Math.max(0, depth - 1);
+      i += 1;
+      continue;
+    }
+    if (databaseType === "mysql" && depth === 0 && matchesWord(sql, i, "into")) {
+      const targetEnd = collectMysqlSelectIntoTargets(sql, i + "into".length, declared);
+      if (targetEnd !== null) {
+        i = targetEnd;
+        continue;
+      }
+    }
     if (ch === "@") {
       const name = readParameterName(sql, i + 1);
       if (name && next !== "@" && sql[i - 1] !== "@" && isSetAssignmentTarget(sql, i + 1 + name.length)) {
@@ -1334,7 +1534,22 @@ function collectSelectAssignmentVariables(sql: string, start: number, declared: 
   return i;
 }
 
-function collectRoutineDefinitionVariables(sql: string, start: number, declared: Set<string>): number {
+function collectMysqlSelectIntoTargets(sql: string, start: number, declared: Set<string>): number | null {
+  let i = skipSqlWhitespaceAndComments(sql, start);
+  let found = false;
+  while (i < sql.length && sql[i] === "@" && sql[i + 1] !== "@" && sql[i - 1] !== "@") {
+    const name = readParameterName(sql, i + 1);
+    if (!name) break;
+    declared.add(name.toLowerCase());
+    found = true;
+    i = skipSqlWhitespaceAndComments(sql, i + 1 + name.length);
+    if (sql[i] !== ",") break;
+    i = skipSqlWhitespaceAndComments(sql, i + 1);
+  }
+  return found ? i : null;
+}
+
+function collectRoutineDefinitionVariables(sql: string, start: number, declared: Set<string>, databaseType?: DatabaseType): number {
   let i = start;
   while (i < sql.length) {
     const ch = sql[i];
@@ -1346,7 +1561,7 @@ function collectRoutineDefinitionVariables(sql: string, start: number, declared:
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -1374,7 +1589,7 @@ function collectRoutineDefinitionVariables(sql: string, start: number, declared:
   return i;
 }
 
-function collectExecNamedArgumentStarts(sql: string, start: number, ignoredStarts: Set<number>): number {
+function collectExecNamedArgumentStarts(sql: string, start: number, ignoredStarts: Set<number>, databaseType?: DatabaseType): number {
   let i = start;
   while (i < sql.length) {
     const ch = sql[i];
@@ -1386,7 +1601,7 @@ function collectExecNamedArgumentStarts(sql: string, start: number, ignoredStart
       continue;
     }
     if (ch === "[") {
-      i = skipBracketIdentifier(sql, i);
+      i = skipBracketIdentifier(sql, i, databaseType);
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -1412,6 +1627,16 @@ function collectExecNamedArgumentStarts(sql: string, start: number, ignoredStart
     i += 1;
   }
   return i;
+}
+
+// MySQL's GET DIAGNOSTICS writes its results into the user variables on the left
+// of each assignment (`GET DIAGNOSTICS CONDITION 1 @err = MESSAGE_TEXT`), exactly
+// as SET and SELECT ... INTO do. Returns the offset just past the statement's
+// leading keywords, or null when `start` is an ordinary `get` identifier.
+function readGetDiagnosticsEnd(sql: string, start: number): number | null {
+  let keyword = readNextKeyword(sql, start + "get".length);
+  if (keyword?.word === "current" || keyword?.word === "stacked") keyword = readNextKeyword(sql, keyword.end);
+  return keyword?.word === "diagnostics" ? keyword.end : null;
 }
 
 function isRoutineDefinitionStart(sql: string, start: number): boolean {
@@ -1478,6 +1703,22 @@ function readParameterName(sql: string, start: number): string {
   return sql.slice(start, i);
 }
 
+/**
+ * Match the bracketed-shell placeholder `[${name}]` (Navicat-style). All five
+ * segments — "[", "${", a valid parameter name, "}", "]" — must match, and the
+ * brackets belong to the token so they disappear on substitution. Any mismatch
+ * returns null so the caller falls back to the default "[" handling without
+ * consuming characters.
+ */
+function tryReadBracketedShellPlaceholder(sql: string, start: number): ParameterOccurrence | null {
+  if (sql[start] !== "[" || sql[start + 1] !== "$" || sql[start + 2] !== "{") return null;
+  const closeBrace = sql.indexOf("}", start + 3);
+  if (closeBrace === -1 || sql[closeBrace + 1] !== "]") return null;
+  const name = sql.slice(start + 3, closeBrace).trim();
+  if (!PARAMETER_NAME_RE.test(name)) return null;
+  return { key: name, name, syntax: "bracketed-shell", token: sql.slice(start, closeBrace + 2), start, end: closeBrace + 2 };
+}
+
 /** Match only unprefixed quote + exact `${name}`/`#{name}` + same quote. Leaves skipQuoted unchanged. */
 function tryReadQuotedBracedPlaceholder(sql: string, start: number, quote: "'" | '"', isSyntaxEnabled: (syntax: SqlParameterSyntax) => boolean): ParameterOccurrence | null {
   if (sql[start] !== quote) return null;
@@ -1508,6 +1749,82 @@ function tryReadQuotedBracedPlaceholder(sql: string, start: number, quote: "'" |
     key: name,
     name,
     syntax,
+    token: sql.slice(start, end),
+    ...(quote === "'" ? { replacement: "quoted-string" as const } : {}),
+    start,
+    end,
+  };
+}
+
+function tryReadQuotedSubstitutionPlaceholder(sql: string, start: number, databaseType?: DatabaseType): ParameterOccurrence | null {
+  if (sql[start] !== "'") return null;
+  if (hasSqlStringLiteralPrefix(sql, start)) return null;
+
+  const contentStart = start + 1;
+  if (sql[contentStart] !== "&") return null;
+
+  const isDouble = sql[contentStart + 1] === "&";
+  const prefixLength = isDouble ? 2 : 1;
+  const nameStart = contentStart + prefixLength;
+  if (sql[nameStart] === "&") return null;
+  if (/^&(?:lt|gt|amp|quot|apos);/i.test(sql.slice(contentStart))) return null;
+
+  let nameEnd = nameStart;
+  if (/[0-9]/.test(sql[nameStart] ?? "")) {
+    while (nameEnd < sql.length && /[0-9]/.test(sql[nameEnd] ?? "")) nameEnd += 1;
+  } else if (PARAMETER_NAME_START_RE.test(sql[nameStart] ?? "")) {
+    while (nameEnd < sql.length && PARAMETER_NAME_CHAR_RE.test(sql[nameEnd] ?? "")) nameEnd += 1;
+  } else {
+    return null;
+  }
+  if (nameEnd === nameStart) return null;
+
+  const name = sql.slice(nameStart, nameEnd);
+  let contentEnd = nameEnd;
+  if (sql[contentEnd] === ".") contentEnd += 1;
+
+  if (sql[contentEnd] !== "'") return null;
+  const quoteEnd = contentEnd + 1;
+  if (skipQuoted(sql, start, "'", databaseType) !== quoteEnd) return null;
+
+  return {
+    key: name,
+    name,
+    syntax: "substitution",
+    token: sql.slice(start, quoteEnd),
+    replacement: "quoted-string",
+    start,
+    end: quoteEnd,
+  };
+}
+
+function readSubstitutionParameterOccurrence(sql: string, start: number): ParameterOccurrence | null {
+  if (start > 0 && (PARAMETER_NAME_CHAR_RE.test(sql[start - 1] ?? "") || sql[start - 1] === "?" || sql[start - 1] === "&")) return null;
+
+  const isDouble = sql[start + 1] === "&";
+  const prefixLength = isDouble ? 2 : 1;
+  const nameStart = start + prefixLength;
+  if (sql[nameStart] === "&") return null;
+  if (/^&(?:lt|gt|amp|quot|apos);/i.test(sql.slice(start))) return null;
+
+  let nameEnd = nameStart;
+  if (/[0-9]/.test(sql[nameStart] ?? "")) {
+    while (nameEnd < sql.length && /[0-9]/.test(sql[nameEnd] ?? "")) nameEnd += 1;
+  } else if (PARAMETER_NAME_START_RE.test(sql[nameStart] ?? "")) {
+    while (nameEnd < sql.length && PARAMETER_NAME_CHAR_RE.test(sql[nameEnd] ?? "")) nameEnd += 1;
+  } else {
+    return null;
+  }
+  if (nameEnd === nameStart) return null;
+
+  const name = sql.slice(nameStart, nameEnd);
+  let end = nameEnd;
+  if (sql[end] === ".") end += 1;
+
+  return {
+    key: name,
+    name,
+    syntax: "substitution",
     token: sql.slice(start, end),
     start,
     end,
@@ -1570,10 +1887,29 @@ function hasSqlStringLiteralPrefix(sql: string, quoteStart: number): boolean {
   return PARAMETER_NAME_CHAR_RE.test(sql[quoteStart - 1]);
 }
 
-function skipQuoted(sql: string, start: number, quote: string): number {
+function skipOracleAlternativeQuoted(sql: string, quoteStart: number): number | null {
+  if (sql[quoteStart - 1]?.toLowerCase() !== "q") return null;
+  const prefixStart = sql[quoteStart - 2]?.toLowerCase() === "n" ? quoteStart - 2 : quoteStart - 1;
+  const previous = sql[prefixStart - 1] ?? "";
+  if (PARAMETER_NAME_CHAR_RE.test(previous) || previous === "$" || previous === "#") return null;
+
+  const openerCodePoint = sql.codePointAt(quoteStart + 1);
+  if (openerCodePoint === undefined) return null;
+  const opener = String.fromCodePoint(openerCodePoint);
+  if (/\s/.test(opener)) return null;
+  const closer = ({ "[": "]", "{": "}", "(": ")", "<": ">" } as Record<string, string>)[opener] ?? opener;
+  const end = sql.indexOf(closer + "'", quoteStart + 1 + opener.length);
+  return end === -1 ? sql.length : end + closer.length + 1;
+}
+
+function skipQuoted(sql: string, start: number, quote: string, databaseType?: DatabaseType): number {
+  if (quote === "'" && (databaseType === "oracle" || databaseType === "oceanbase-oracle")) {
+    const end = skipOracleAlternativeQuoted(sql, start);
+    if (end !== null) return end;
+  }
   let i = start + 1;
   while (i < sql.length) {
-    if (sql[i] === "\\" && quote === "'" && i + 1 < sql.length) {
+    if (sql[i] === "\\" && quote === "'" && databaseType !== "oracle" && databaseType !== "oceanbase-oracle" && i + 1 < sql.length) {
       i += 2;
       continue;
     }
@@ -1589,7 +1925,12 @@ function skipQuoted(sql: string, start: number, quote: string): number {
   return sql.length;
 }
 
-function skipBracketIdentifier(sql: string, start: number): number {
+function skipBracketIdentifier(sql: string, start: number, databaseType?: DatabaseType): number {
+  // PostgreSQL uses square brackets for ARRAY constructors and subscripts, not
+  // for delimited identifiers. Leave the opening bracket in the lexical stream
+  // so quoted array elements cannot corrupt the following SQL state.
+  if (databaseType === "postgres") return start + 1;
+
   let i = start + 1;
   while (i < sql.length) {
     if (sql[i] === "]") {
@@ -1629,6 +1970,20 @@ function isSqlServerTempTableReference(sql: string, start: number): boolean {
   return !!previous && SQL_SERVER_TEMP_TABLE_CONTEXT_KEYWORDS.has(previous);
 }
 
+function isPostgresArrayConstructorBracket(sql: string, start: number, parentIsConstructor: boolean): boolean {
+  if (previousKeyword(sql, start) === "array") return true;
+  if (!parentIsConstructor) return false;
+
+  let previous = start - 1;
+  while (previous >= 0 && /\s/.test(sql[previous])) previous -= 1;
+  return sql[previous] === "[" || sql[previous] === ",";
+}
+
+function isPostgresSliceSeparator(stack: Array<{ constructor: boolean; parenthesisDepth: number }>, parenthesisDepth: number): boolean {
+  const context = stack[stack.length - 1];
+  return !!context && !context.constructor && context.parenthesisDepth === parenthesisDepth;
+}
+
 function previousKeyword(sql: string, start: number): string {
   let end = start - 1;
   while (end >= 0 && /\s/.test(sql[end])) end -= 1;
@@ -1650,6 +2005,11 @@ function quoteSqlString(value: string): string {
 
 function sqlParameterStringFragment(input: SqlParameterInput): string {
   return input.value.replace(/'/g, "''");
+}
+
+function sqlParameterQuotedString(input: SqlParameterInput): string {
+  if (input.kind === "null" || ((input.kind === "number" || input.kind === "raw") && !input.value.trim())) return "NULL";
+  return quoteSqlString(input.value);
 }
 
 function normalizeBooleanLiteral(value: string): string {

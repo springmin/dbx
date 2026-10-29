@@ -51,13 +51,14 @@ test("maps GBase profiles to their matching agent driver keys", () => {
   assert.equal(agentDriverInstallKey("gbase"), "gbase8a");
   assert.equal(agentDriverInstallKey("gbase", "gbase"), "gbase8a");
   assert.equal(agentDriverInstallKey("gbase", "gbase8a"), "gbase8a");
-  assert.equal(agentDriverInstallKey("gbase", "gbase8s"), "gbase8s");
+  assert.equal(agentDriverInstallKey("gbase8s"), "gbase8s");
+  assert.equal(agentDriverInstallKey("gbase8s", "gbase8s"), "gbase8s");
 });
 
 test("uses the selected GBase 8s agent for install hints", () => {
   assert.equal(
     showAgentDriverInstallHint(
-      "gbase",
+      "gbase8s",
       [
         { db_type: "gbase", installed: true },
         { db_type: "gbase8s", installed: false },
@@ -68,7 +69,7 @@ test("uses the selected GBase 8s agent for install hints", () => {
   );
   assert.equal(
     showAgentDriverInstallHint(
-      "gbase",
+      "gbase8s",
       [
         { db_type: "gbase", installed: false },
         { db_type: "gbase8s", installed: true },
@@ -89,7 +90,7 @@ test("uses unified Oracle and selected profile keys for update hints", () => {
   assert.equal(hasAgentDriverUpdate("oracle", [{ db_type: "oracle", installed: true, update_available: true }], "oracle-10g"), true);
   assert.equal(
     hasAgentDriverUpdate(
-      "gbase",
+      "gbase8s",
       [
         { db_type: "gbase", installed: true, update_available: false },
         { db_type: "gbase8s", installed: true, update_available: true },
@@ -98,6 +99,13 @@ test("uses unified Oracle and selected profile keys for update hints", () => {
     ),
     true,
   );
+});
+
+test("uses one H2 agent for every H2 profile", () => {
+  for (const profile of ["h2", "h2-v1", "h2-v2", "h2-v3", "h2-custom", "h2-legacy"]) {
+    assert.equal(agentDriverInstallKey("h2", profile), "h2");
+    assert.equal(showAgentDriverInstallHint("h2", [{ db_type: "h2", installed: true }], profile), false);
+  }
 });
 
 test("appends agent driver update hints once", () => {

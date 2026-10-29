@@ -3,6 +3,7 @@ package com.dbx.agent.dameng;
 import com.dbx.agent.DatabaseAgent;
 import com.dbx.agent.ExecuteQueryOptions;
 import com.dbx.agent.IndexInfo;
+import com.dbx.agent.JdbcExecutor;
 import com.dbx.agent.MetadataListConstraints;
 import com.dbx.agent.QueryPageOptions;
 import com.dbx.agent.QueryPageResult;
@@ -12,15 +13,18 @@ import com.dbx.agent.test.JdbcAgentFake;
 import com.dbx.agent.test.TestSupport;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.net.SocketTimeoutException;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.SQLTransientConnectionException;
 import java.sql.Statement;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -57,6 +61,24 @@ class DamengAgentTest extends JdbcFakeExecutionBehaviorTest {
         assertEquals(List.of("PLAN"), result.getColumns());
         assertEquals(List.of(List.of("row-value")), result.getRows());
         assertEquals(List.of("executeQuery"), JdbcAgentFake.calls);
+    }
+
+    @Test
+    void readsVarchar2AsTextWhenDriverReportsNumericSqlType() throws Exception {
+        DamengAgent agent = new DamengAgent();
+        ResultSet resultSet = (ResultSet) Proxy.newProxyInstance(
+            ResultSet.class.getClassLoader(),
+            new Class<?>[] {ResultSet.class},
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getString" -> "001";
+                case "wasNull" -> false;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+
+        JdbcExecutor.ColumnAwareResultValueReader reader = (JdbcExecutor.ColumnAwareResultValueReader) agent.resultValueReader();
+
+        assertEquals("001", reader.read(resultSet, 1, Types.NUMERIC, "VARCHAR2"));
     }
 
     @Test
@@ -101,6 +123,18 @@ class DamengAgentTest extends JdbcFakeExecutionBehaviorTest {
     }
 
     @Test
+    void legacyDamengSkipsUnavailableDbmsOutputInitialization() {
+        List<String> executedSql = new ArrayList<>();
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, printMessageConnection(null, executedSql));
+        setLegacyJdbcMetadata(agent, true);
+
+        agent.executeQuery("BEGIN NULL; END;", null, new ExecuteQueryOptions());
+
+        assertEquals(List.of("BEGIN NULL; END;"), executedSql);
+    }
+
+    @Test
     void outputStatementsEnableDbmsOutputOncePerPhysicalConnection() {
         List<String> firstConnectionSql = new ArrayList<>();
         List<String> secondConnectionSql = new ArrayList<>();
@@ -140,6 +174,21 @@ class DamengAgentTest extends JdbcFakeExecutionBehaviorTest {
     void unsupportedOrRestrictedDbmsOutputDoesNotBlockUserSql() {
         assertDbmsOutputFailureFallsBack(new SQLFeatureNotSupportedException("unsupported", "0A000"));
         assertDbmsOutputFailureFallsBack(new SQLException("permission denied", "42000"));
+    }
+
+    /**
+     * 达梦中文环境在无权限时只回「权限不足」（vendorCode -5669，SQLState 28000），消息里不带
+     * `dbms_output` 字样。这类错误同样只是可选的 DBMS_OUTPUT 初始化失败，不能阻断用户自己的 SQL
+     * （#11875 反馈人点名的同源问题）。
+     */
+    @Test
+    void chinesePermissionDeniedOnDbmsOutputDoesNotBlockUserSql() {
+        assertDbmsOutputFailureFallsBack(new SQLException("权限不足", "28000", -5669));
+
+        // DM 常在首个异常上挂 cause / nextException，链上任意一环是权限错误都应降级。
+        SQLException wrapped = new SQLException("执行失败", "HY000");
+        wrapped.setNextException(new SQLException("权限不足", "28000", -5669));
+        assertDbmsOutputFailureFallsBack(wrapped);
     }
 
     @Test
@@ -214,6 +263,22 @@ class DamengAgentTest extends JdbcFakeExecutionBehaviorTest {
             "BEGIN DBMS_OUTPUT.ENABLE(1000000); END;",
             "CALL LOG_ONLY_PROCEDURE('input')"
         ), executedSql);
+    }
+
+    @Test
+    void legacyStatementWithoutJdbc4UnwrapReturnsNoPrintMessages() {
+        Statement statement = (Statement) Proxy.newProxyInstance(
+            DamengAgentTest.class.getClassLoader(),
+            new Class<?>[]{Statement.class},
+            (unused, method, args) -> {
+                if ("unwrap".equals(method.getName())) {
+                    throw new AbstractMethodError("legacy JDBC driver");
+                }
+                return defaultValue(method.getReturnType());
+            }
+        );
+
+        assertEquals(List.of(), DamengAgent.statementPrintMessages(statement));
     }
 
     @Test
@@ -425,6 +490,19 @@ class DamengAgentTest extends JdbcFakeExecutionBehaviorTest {
     }
 
     @Test
+    void constrainedObjectQueriesIncludeTypesAndBodies() {
+        DamengAgent.MetadataQuery query = DamengAgent.buildConstrainedObjectsQuery(
+            "APP", new MetadataListConstraints(null, 20, null, List.of("TYPE", "TYPE_BODY")));
+        assertTrue(query.sql().contains("o.OBJECT_TYPE IN (?, ?)"));
+        assertEquals(List.of("APP", "TYPE", "TYPE BODY", 20), query.args());
+
+        DamengAgent.MetadataQuery raw = DamengAgent.buildRawConstrainedObjectsQuery(
+            "APP", new MetadataListConstraints(null, null, null, List.of("TYPE", "TYPE_BODY")));
+        assertTrue(raw.sql().contains("o.OBJECT_TYPE IN (?, ?)"));
+        assertEquals(List.of("APP", "TYPE", "TYPE BODY"), raw.args());
+    }
+
+    @Test
     void rawObjectQueryIncludesDamengPackageBodyCatalogType() {
         DamengAgent.MetadataQuery query = DamengAgent.buildRawConstrainedObjectsQuery(
             "APP",
@@ -618,6 +696,16 @@ class DamengAgentTest extends JdbcFakeExecutionBehaviorTest {
 
         assertSame(failure, error.getCause());
         assertEquals(List.of("BEGIN DBMS_OUTPUT.ENABLE(1000000); END;"), executedSql);
+    }
+
+    private static void setLegacyJdbcMetadata(DamengAgent agent, boolean value) {
+        try {
+            Field field = DamengAgent.class.getDeclaredField("legacyJdbcMetadata");
+            field.setAccessible(true);
+            field.set(agent, value);
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("Unable to set legacy JDBC metadata mode", error);
+        }
     }
 
     private static Object defaultValue(Class<?> type) {

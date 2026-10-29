@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CompletionAssistantCandidate, TreeNode } from "@/types/database";
-import { buildPackageMemberNodes, markPackageNodesExpandable } from "@/lib/sidebar/packageMembers";
+import { buildPackageMemberNodes, markPackageNodesExpandable, packageMemberGroupOwnerId } from "@/lib/sidebar/packageMembers";
 
 function packageNode(): TreeNode {
   return {
@@ -16,6 +16,24 @@ function packageNode(): TreeNode {
 }
 
 describe("package member tree", () => {
+  it.each(["oracle", "oceanbase-oracle"] as const)("preserves exact quoted member names for %s debugger targets", (databaseType) => {
+    const name = ' Mixed.Name"\n ';
+    const parent = { ...packageNode(), objectName: ' Pkg." ', schema: ' Owner." ' };
+    const nodes = buildPackageMemberNodes(parent, [{ name, kind: "procedure", routine_id: "exact" }], databaseType);
+    expect(nodes[0]).toMatchObject({ objectName: name, parentName: parent.objectName, schema: parent.schema });
+  });
+
+  it("keeps OceanBase overload identities when their signatures are unknown or identical", () => {
+    const candidates: CompletionAssistantCandidate[] = [
+      { name: "RUN", kind: "procedure", signature: null, routine_id: "APP:101:1" },
+      { name: "RUN", kind: "procedure", signature: null, routine_id: "APP:101:2" },
+      { name: "RUN", kind: "procedure", signature: null, routine_id: "APP:101:2" },
+      { name: "Run", kind: "procedure", signature: "", routine_id: "APP:101:3" },
+    ];
+    const nodes = buildPackageMemberNodes(packageNode(), candidates, "oceanbase-oracle");
+    expect(nodes.map((node) => node.objectName)).toEqual(["RUN", "RUN", "Run"]);
+    expect(new Set(nodes.map((node) => node.id)).size).toBe(3);
+  });
   it("marks package specifications as expandable without changing other objects", () => {
     const nodes: TreeNode[] = [packageNode(), { id: "body", label: "business_api", type: "package-body" }, { id: "proc", label: "standalone", type: "procedure" }];
     const result = markPackageNodesExpandable(nodes);
@@ -42,6 +60,9 @@ describe("package member tree", () => {
     expect(result[1]?.children?.map((node) => node.label)).toEqual(["lookup"]);
     expect(result.flatMap((node) => node.children ?? []).every((node) => node.parentName === "business_api" && node.parentSchema === "app_schema" && node.parentType === "package" && node.valid === false)).toBe(true);
     expect(new Set(result.flatMap((node) => node.children ?? []).map((node) => node.id)).size).toBe(3);
+    expect(packageMemberGroupOwnerId(result[0]!)).toBe(packageNode().id);
+    expect(packageMemberGroupOwnerId({ ...result[0]!, parentType: undefined })).toBeNull();
+    expect(packageMemberGroupOwnerId({ ...result[0]!, id: "invalid" })).toBeNull();
   });
 
   it("keeps package body source metadata on the package without adding a duplicate body node", () => {

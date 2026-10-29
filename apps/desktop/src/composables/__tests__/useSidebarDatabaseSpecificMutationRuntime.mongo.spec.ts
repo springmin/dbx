@@ -89,6 +89,31 @@ function mongoConfig(driverProfile?: string, production = false) {
   };
 }
 
+function milvusConfig(database?: string) {
+  return {
+    id: "conn-1",
+    name: "Milvus",
+    db_type: "milvus" as const,
+    host: "localhost",
+    port: 19530,
+    username: "",
+    password: "",
+    database,
+  };
+}
+
+function milvusDatabaseNode(database: string): TreeNode {
+  return {
+    id: `conn-1:${database}`,
+    label: database,
+    type: "vector-database",
+    connectionId: "conn-1",
+    database,
+    isExpanded: false,
+    children: [],
+  };
+}
+
 function mongoDatabaseNode(): TreeNode {
   return {
     id: "conn-1:app",
@@ -209,6 +234,29 @@ describe("MongoDB sidebar mutation runtime", () => {
     cloneMongoCollectionLoading.value = false;
   });
 
+  it("protects the built-in and configured Milvus databases from deletion", () => {
+    mocks.getConfig.mockReturnValue(milvusConfig("analytics"));
+    const activeNode = shallowRef(milvusDatabaseNode("default"));
+    const feature = useSidebarDatabaseSpecificMutationRuntime({
+      activeNode,
+      connectionStore: {
+        getConfig: mocks.getConfig,
+      } as any,
+    });
+
+    expect(feature.canDropMilvusDatabase.value).toBe(false);
+
+    activeNode.value = milvusDatabaseNode("analytics");
+    expect(feature.canDropMilvusDatabase.value).toBe(false);
+
+    activeNode.value = milvusDatabaseNode("archive");
+    expect(feature.canDropMilvusDatabase.value).toBe(true);
+
+    mocks.getConfig.mockReturnValue(mongoConfig());
+    activeNode.value = milvusDatabaseNode("archive-2");
+    expect(feature.canDropMilvusDatabase.value).toBe(false);
+  });
+
   it("keeps Legacy MongoDB mutations available while limiting index actions to the Indexes group", () => {
     mocks.getConfig.mockReturnValue(mongoConfig("mongodb-legacy"));
     const activeNode = shallowRef(mongoDatabaseNode());
@@ -229,7 +277,8 @@ describe("MongoDB sidebar mutation runtime", () => {
     activeNode.value = mongoCollectionNode();
     expect(feature.canDropMongoCollection.value).toBe(true);
     expect(feature.canDropAllMongoIndexes.value).toBe(false);
-    expect(feature.canRenameMongoCollection.value).toBe(false);
+    // The Legacy Agent supports renameCollection (capability-gated in the backend).
+    expect(feature.canRenameMongoCollection.value).toBe(true);
     expect(feature.canCloneMongoCollection.value).toBe(true);
     expect(feature.canCreateMongoIndex.value).toBe(false);
     activeNode.value = mongoIndexesGroupNode();

@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  autoRedisValueFormat,
   canRenderRedisValueFormat,
+  detectedRedisStructuredCodec,
   formatRedisMemberDetail,
   formatRedisStringValue,
   getRedisMemberSelectionKey,
+  isRedisJsonContainerValue,
+  jsonToXmlText,
+  jsonToYamlText,
   normalizeRedisJsonDraft,
+  parseRedisJsonDetail,
   preferredRedisValueFormat,
   redisClipboardSafeText,
   redisJsonValueText,
@@ -178,6 +184,23 @@ describe("redisValuePresentation", () => {
     expect(redisValueSize(value)).toBe(1);
   });
 
+  it("uses the original byte count for a truncated Redis String preview", () => {
+    const value = {
+      key_display: "bf:ali_health_monitor",
+      key_raw: "YmY6YWxpX2hlYWx0aF9tb25pdG9y",
+      ttl: -1,
+      redis_type: "string",
+      data: {
+        kind: "string" as const,
+        content: { raw_base64: "cHJldmlldw==", encoding: "utf8" as const },
+        total_bytes: 45 * 1024 * 1024,
+        truncated: true,
+      },
+    };
+
+    expect(redisValueSize(value)).toBe(45 * 1024 * 1024);
+  });
+
   it("labels raw text views by encoding instead of generic raw text", () => {
     expect(formatRedisMemberDetail("plain-text").rawLabel).toBe("ASCII");
     expect(
@@ -227,7 +250,7 @@ describe("redisValuePresentation", () => {
         },
         { allowJsonText: true },
       ).availableFormats,
-    ).toEqual(["utf8", "ascii", "binary", "json", "hex", "base64"]);
+    ).toEqual(["utf8", "ascii", "binary", "json", "unicodejson", "yaml", "xml", "hex", "base64"]);
   });
 
   it("falls back to utf8 when a binary inspection view was stored for editable text", () => {
@@ -242,17 +265,92 @@ describe("redisValuePresentation", () => {
     expect(preferredRedisValueFormat(blob, "json", { allowJsonText: true })).toBe("utf8");
   });
 
-  it("adds a Java serialized format when the blob uses Java object serialization", () => {
+  it("keeps Java serialized payloads on the codec axis, not the view tabs", () => {
     const detail = formatRedisMemberDetail({
       raw_base64: "rO0ABXQACHNvbWV0ZXh0",
       encoding: "binary",
     });
 
-    expect(detail.availableFormats).toEqual(["javaserialize", "binary", "hex", "base64"]);
-    expect(detail.defaultFormat).toBe("javaserialize");
+    expect(detail.availableFormats).toEqual(["hex", "binary", "base64"]);
+    expect(detail.defaultFormat).toBe("hex");
+    expect(detail.defaultCodec).toBe("none");
+    expect(detail.availableCodecs).toContain("javaserialize");
     expect(detail.javaSerialized?.formattedText).toBe('"sometext"');
-    expect(canRenderRedisValueFormat(detail, "javaserialize")).toBe(true);
-    expect(canRenderRedisValueFormat(formatRedisMemberDetail("plain-text"), "javaserialize")).toBe(false);
+    expect(canRenderRedisValueFormat(detail, "json")).toBe(false);
+    expect(canRenderRedisValueFormat(formatRedisMemberDetail("plain-text"), "utf8")).toBe(true);
+  });
+
+  it("auto-opens JSON containers pretty-printed when no format was pinned", () => {
+    const detail = formatRedisMemberDetail('{"role":"reader"}', { allowJsonText: true });
+    expect(autoRedisValueFormat(detail, null)).toBe("json");
+  });
+
+  it("keeps scalar JSON and plain text on the raw utf8 view", () => {
+    expect(autoRedisValueFormat(formatRedisMemberDetail("123", { allowJsonText: true }), null)).toBe("utf8");
+    expect(autoRedisValueFormat(formatRedisMemberDetail("plain-text", { allowJsonText: true }), null)).toBe("utf8");
+  });
+
+  it("lets a pinned format preference win over JSON detection", () => {
+    const detail = formatRedisMemberDetail('{"role":"reader"}', { allowJsonText: true });
+    expect(autoRedisValueFormat(detail, "utf8")).toBe("utf8");
+    expect(autoRedisValueFormat(detail, "json")).toBe("json");
+  });
+
+  it("keeps non-reusable view preferences falling back to the value default", () => {
+    const detail = formatRedisMemberDetail('{"role":"reader"}', { allowJsonText: true });
+    expect(autoRedisValueFormat(detail, "hex")).toBe("utf8");
+  });
+
+  it("still honors binary inspection views on non-editable blobs", () => {
+    const detail = formatRedisMemberDetail({
+      raw_base64: Buffer.from([0x00, 0x01, 0x02]).toString("base64"),
+      encoding: "binary",
+    });
+
+    expect(autoRedisValueFormat(detail, "hex")).toBe("hex");
+    expect(autoRedisValueFormat(detail, null)).toBe("hex");
+  });
+
+  it("maps detected structured payloads to their codec", () => {
+    const java = formatRedisMemberDetail({ raw_base64: "rO0ABXQACHNvbWV0ZXh0", encoding: "binary" });
+    expect(detectedRedisStructuredCodec(java)).toBe("javaserialize");
+
+    const plain = formatRedisMemberDetail("plain-text", { allowJsonText: true });
+    expect(detectedRedisStructuredCodec(plain)).toBeNull();
+  });
+
+  it("auto-detects msgpack only when the decoded value is a container", () => {
+    // {"a":1} encoded as msgpack.
+    const container = formatRedisMemberDetail({
+      raw_base64: Buffer.from([0x81, 0xa1, 0x61, 0x01]).toString("base64"),
+      encoding: "binary",
+    });
+    expect(detectedRedisStructuredCodec(container)).toBe("msgpack");
+
+    // Single ASCII bytes are valid msgpack fixints, so scalar payloads must
+    // stay undetected: a counter key of "1" must not render as 49.
+    for (const scalar of ["1", "0", "Y", "é"]) {
+      const detail = formatRedisMemberDetail(scalar, { allowJsonText: true });
+      expect(detectedRedisStructuredCodec(detail)).toBeNull();
+    }
+  });
+
+  it("treats only objects and arrays as JSON containers", () => {
+    expect(isRedisJsonContainerValue({ a: 1 })).toBe(true);
+    expect(isRedisJsonContainerValue([1])).toBe(true);
+    expect(isRedisJsonContainerValue("123")).toBe(false);
+    expect(isRedisJsonContainerValue(null)).toBe(false);
+    expect(isRedisJsonContainerValue(undefined)).toBe(false);
+  });
+
+  it("keeps legacy Pickle payloads out of conservative auto-detection", () => {
+    const detail = formatRedisMemberDetail({
+      raw_base64: "KGRwMApWc3RhdHVzCnAxClZTVUNDRVNTCnAyCnNWcmVzdWx0CnAzCihscDQKSTEKYVZoZWxsbwpwNQphTmFJMDEKYUkwMAphcy4=",
+      encoding: "binary",
+    });
+
+    expect(detail.pickle).toBeUndefined();
+    expect(detail.defaultCodec).toBe("none");
   });
 
   it("keeps self-referential Java maps representable via refs", () => {
@@ -284,5 +382,87 @@ describe("redisValuePresentation", () => {
         encoding: "binary",
       }),
     ).toBe("\\xac\\xed\\x00\\x05");
+  });
+
+  it("renders JSON values as YAML", () => {
+    expect(
+      jsonToYamlText({
+        id: 1,
+        name: "Ada",
+        tags: ["redis", "db"],
+        meta: { host: "localhost", port: 6379 },
+        empty: {},
+        items: [],
+      }),
+    ).toBe("id: 1\nname: Ada\ntags:\n  - redis\n  - db\nmeta:\n  host: localhost\n  port: 6379\nempty: {}\nitems: []\n");
+  });
+
+  it("quotes YAML scalars that would otherwise change type", () => {
+    expect(jsonToYamlText({ port: "6379", flag: "true", label: "hello world", none: "null" })).toBe('port: "6379"\nflag: "true"\nlabel: "hello world"\nnone: "null"\n');
+  });
+
+  it("renders JSON values as XML", () => {
+    expect(jsonToXmlText({ id: 1, name: "Ada", tags: ["redis", "db"] })).toBe('<?xml version="1.0" encoding="UTF-8"?>\n<root>\n  <id>1</id>\n  <name>Ada</name>\n  <tags>redis</tags>\n  <tags>db</tags>\n</root>');
+  });
+
+  it("escapes XML text and sanitizes unsafe tag names", () => {
+    expect(jsonToXmlText({ query: 'a < "b" & c', "1st": "entry" })).toBe('<?xml version="1.0" encoding="UTF-8"?>\n<root>\n  <query>a &lt; &quot;b&quot; &amp; c</query>\n  <_1st>entry</_1st>\n</root>');
+  });
+
+  it("uses a valid fallback tag for empty JSON keys", () => {
+    expect(jsonToXmlText({ "": 1 })).toBe('<?xml version="1.0" encoding="UTF-8"?>\n<root>\n  <item>1</item>\n</root>');
+  });
+
+  it("unwraps serialized JSON strings into structured JSON containers (issue #11636)", () => {
+    const serializedObject = '"{\\"abc\\":\\"\\"}"';
+    const detail = parseRedisJsonDetail(serializedObject);
+    expect(detail).not.toBeNull();
+    expect(detail?.formattedText).toBe('{\n  "abc": ""\n}');
+    expect(detail?.value).toEqual({ abc: "" });
+    expect(detail?.serializedLevel).toBe(1);
+
+    const serializedArray = '"[{\\"id\\":1},{\\"id\\":2}]"';
+    const arrayDetail = parseRedisJsonDetail(serializedArray);
+    expect(arrayDetail).not.toBeNull();
+    expect(arrayDetail?.value).toEqual([{ id: 1 }, { id: 2 }]);
+    expect(arrayDetail?.serializedLevel).toBe(1);
+
+    // Double-serialized JSON string unwraps through multiple levels
+    const doubleSerialized = JSON.stringify(JSON.stringify(JSON.stringify({ nested: true })));
+    const doubleDetail = parseRedisJsonDetail(doubleSerialized);
+    expect(doubleDetail).not.toBeNull();
+    expect(doubleDetail?.value).toEqual({ nested: true });
+    expect(doubleDetail?.serializedLevel).toBe(2);
+  });
+
+  it("auto-detects serialized JSON containers and sets format to json (issue #11636)", () => {
+    const memberDetail = formatRedisMemberDetail('"{\\"abc\\":\\"\\"}"', { allowJsonText: true });
+    expect(memberDetail.json).toBeDefined();
+    expect(isRedisJsonContainerValue(memberDetail.json?.value)).toBe(true);
+    expect(autoRedisValueFormat(memberDetail, null)).toBe("json");
+  });
+
+  it("normalizes serialized JSON drafts with serializedLevel (issue #11636)", () => {
+    const draft = '{\n  "abc": "xyz"\n}';
+    expect(normalizeRedisJsonDraft(draft, 1)).toEqual({
+      ok: true,
+      compactText: '"{\\"abc\\":\\"xyz\\"}"',
+    });
+    expect(normalizeRedisJsonDraft(draft, 2)).toEqual({
+      ok: true,
+      compactText: '"\\"{\\\\\\"abc\\\\\\":\\\\\\"xyz\\\\\\"}\\""',
+    });
+  });
+
+  it("keeps serialized scalar strings as plain text without unwrapping", () => {
+    const scalarString = '"hello world"';
+    const detail = parseRedisJsonDetail(scalarString);
+    expect(detail?.formattedText).toBe('"hello world"');
+    expect(detail?.value).toBe("hello world");
+    expect(detail?.serializedLevel).toBeUndefined();
+    expect(isRedisJsonContainerValue(detail?.value)).toBe(false);
+
+    const memberDetail = formatRedisMemberDetail(scalarString, { allowJsonText: true });
+    expect(autoRedisValueFormat(memberDetail, null)).toBe("utf8");
   });
 });

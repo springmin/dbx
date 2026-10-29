@@ -6,6 +6,7 @@ export interface TableMetadataCapabilities {
   foreignKeys: boolean;
   constraints: boolean;
   triggers: boolean;
+  partitions: boolean;
   ddl: boolean;
 }
 
@@ -13,16 +14,45 @@ const defaultCapabilities: TableMetadataCapabilities = {
   columns: true,
   indexes: true,
   foreignKeys: true,
-  // Structured PK/UNIQUE/CHECK constraint metadata (list_constraints) is only
-  // implemented by a handful of agent-backed drivers today; leave it off by
-  // default so every other dialect doesn't grow a permanently empty tab.
+  // Structured constraint metadata (list_constraints) is only enabled for
+  // drivers that implement it (PostgreSQL natively; Oracle/OceanBase/Xugu via agents);
+  // leave it off by default so every other dialect doesn't grow a permanently
+  // empty tab.
   constraints: false,
   triggers: true,
+  // Declarative partitioning metadata (pg_partitioned_table / pg_get_partkeydef)
+  // is PostgreSQL-only for now; other dialects leave the tab hidden.
+  partitions: false,
   ddl: true,
 };
 
 const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabilities>>> = {
   oracle: {
+    constraints: true,
+  },
+  "oceanbase-oracle": {
+    constraints: true,
+  },
+  // KingbaseES V9 shares PostgreSQL's declarative partition catalog and DDL.
+  kingbase: {
+    constraints: true,
+    partitions: true,
+  },
+  vastbase: {
+    constraints: true,
+  },
+  opengauss: {
+    constraints: true,
+  },
+  // PostgreSQL reports full pg_constraint metadata (PK/FK/UNIQUE/CHECK/
+  // EXCLUDE/NOT NULL) through list_constraints.
+  postgres: {
+    constraints: true,
+    partitions: true,
+  },
+  // SQL Server reports PK/UNIQUE/FOREIGN KEY/CHECK/DEFAULT constraints from the
+  // sys.* catalog views through list_constraints.
+  sqlserver: {
     constraints: true,
   },
   mongodb: {
@@ -52,6 +82,27 @@ const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabi
     ddl: false,
   },
   meilisearch: {
+    indexes: false,
+    foreignKeys: false,
+    triggers: false,
+    ddl: false,
+  },
+  solr: {
+    indexes: false,
+    foreignKeys: false,
+    triggers: false,
+    ddl: false,
+  },
+  couchdb: {
+    indexes: false,
+    foreignKeys: false,
+    triggers: false,
+    ddl: false,
+  },
+  // A Salesforce object only has describe metadata: the driver lists fields, and
+  // there is no index, foreign key, trigger or DDL surface behind an SObject, so
+  // those structure tabs would render permanently empty.
+  salesforce: {
     indexes: false,
     foreignKeys: false,
     triggers: false,
@@ -87,6 +138,12 @@ const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabi
     triggers: false,
     ddl: false,
   },
+  influxdb3: {
+    indexes: false,
+    foreignKeys: false,
+    triggers: false,
+    ddl: false,
+  },
   influxdb: {
     indexes: false,
     foreignKeys: false,
@@ -106,8 +163,14 @@ const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabi
   },
 };
 
-export function getTableMetadataCapabilities(dbType?: DatabaseType): TableMetadataCapabilities {
-  return { ...defaultCapabilities, ...(dbType ? capabilityByType[dbType] : undefined) };
+export function getTableMetadataCapabilities(dbType?: DatabaseType, context?: { connectionType?: DatabaseType; exactIdentity?: boolean }): TableMetadataCapabilities {
+  const capabilities = { ...defaultCapabilities, ...(dbType ? capabilityByType[dbType] : undefined) };
+  // Exact JDBC currently implements columns, indexes and DDL only. Do not offer
+  // metadata tabs whose requests cannot preserve the selected raw identity.
+  if (context?.exactIdentity && context.connectionType === "jdbc") {
+    return { ...capabilities, foreignKeys: false, constraints: false, triggers: false, partitions: false };
+  }
+  return capabilities;
 }
 
 export function firstStructureMetadataTab(capabilities: TableMetadataCapabilities, isCreateMode: boolean): TableInfoTab {
@@ -129,6 +192,7 @@ export function isStructureMetadataTabSupported(tab: TableInfoTab, capabilities:
     (tab === "foreignKeys" && capabilities.foreignKeys) ||
     (tab === "constraints" && capabilities.constraints) ||
     (tab === "triggers" && capabilities.triggers) ||
+    (tab === "partitions" && capabilities.partitions) ||
     (tab === "ddl" && capabilities.ddl && !isCreateMode)
   );
 }

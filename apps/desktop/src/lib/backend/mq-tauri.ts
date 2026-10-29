@@ -11,8 +11,11 @@ import type {
   TopicRef,
   TopicInfo,
   ListTopicsOpts,
+  MqListPage,
+  MqListPageRequest,
   TopicStats,
   SubscriptionInfo,
+  KafkaConsumerGroupSnapshot,
   ResetPosition,
   SkipCount,
   ConsumerInfo,
@@ -61,6 +64,10 @@ export async function mqTestConnection(connectionId: string): Promise<MqClusterI
 // Exchanges / Bindings (RabbitMQ)
 export async function mqListExchanges(connectionId: string, ns: NamespaceRef): Promise<MqExchangeInfo[]> {
   return invoke("mq_list_exchanges", { connectionId, ns });
+}
+
+export async function mqListExchangesPage(connectionId: string, ns: NamespaceRef, pagination: MqListPageRequest): Promise<MqListPage<MqExchangeInfo>> {
+  return invoke("mq_list_exchanges_page", { connectionId, ns, pagination });
 }
 
 export async function mqCreateExchange(connectionId: string, ns: NamespaceRef, exchange: MqExchangeCreateRequest): Promise<void> {
@@ -186,6 +193,10 @@ export async function mqListTopics(connectionId: string, ns: NamespaceRef, opts:
   return invoke("mq_list_topics", { connectionId, ns, opts });
 }
 
+export async function mqListTopicsPage(connectionId: string, ns: NamespaceRef, opts: ListTopicsOpts, pagination: MqListPageRequest): Promise<MqListPage<TopicInfo>> {
+  return invoke("mq_list_topics_page", { connectionId, ns, opts, pagination });
+}
+
 export async function mqCreateTopic(connectionId: string, topic: TopicRef, partitions?: number): Promise<void> {
   return invoke("mq_create_topic", { connectionId, topic, partitions });
 }
@@ -213,6 +224,10 @@ export async function mqListSubscriptions(connectionId: string, topic: TopicRef)
 
 export async function mqEnrichSubscriptions(connectionId: string, topic: TopicRef): Promise<SubscriptionInfo[]> {
   return invoke("mq_enrich_subscriptions", { connectionId, topic });
+}
+
+export async function mqGetKafkaConsumerGroupSnapshot(connectionId: string): Promise<KafkaConsumerGroupSnapshot> {
+  return invoke("mq_get_kafka_consumer_group_snapshot", { connectionId });
 }
 
 export async function mqCreateSubscription(connectionId: string, topic: TopicRef, sub: string, pos: ResetPosition): Promise<void> {

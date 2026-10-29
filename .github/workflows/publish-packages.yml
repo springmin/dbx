@@ -25,6 +25,9 @@ jobs:
     name: Publish to Homebrew & Scoop
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
       - name: Extract version from tag
         id: version
         run: |
@@ -47,7 +50,7 @@ jobs:
           TAG="${{ steps.version.outputs.tag }}"
 
           ASSETS=(
-            "${PRODUCT_NAME}_${VERSION}_aarch64.dmg"
+            "${PRODUCT_NAME}_${VERSION}_arm64.dmg"
             "${PRODUCT_NAME}_${VERSION}_x64.dmg"
             "${PRODUCT_NAME}_${VERSION}_x64-setup.exe"
             "${PRODUCT_NAME}_${VERSION}_arm64-setup.exe"
@@ -83,7 +86,7 @@ jobs:
           }
 
           echo "SHA256 hashes:"
-          compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_aarch64.dmg" "sha_dmg_arm64"
+          compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_arm64.dmg" "sha_dmg_arm64"
           compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_x64.dmg" "sha_dmg_x64"
           compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_x64-setup.exe" "sha_exe_x64"
           compute_hash "artifacts/${PRODUCT_NAME}_${VERSION}_arm64-setup.exe" "sha_exe_arm64"
@@ -91,10 +94,16 @@ jobs:
       - name: Publish Homebrew Cask
         env:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           SHA_ARM64="${{ steps.hashes.outputs.sha_dmg_arm64 }}"
           SHA_X64="${{ steps.hashes.outputs.sha_dmg_x64 }}"
+
+          MCP_VERSION="$(curl -fsSL https://registry.npmjs.org/@dbx-app/mcp-server/latest | jq -er '.version')"
+          [[ "$MCP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          gh release download "packages-v${MCP_VERSION}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern SHA256SUMS --dir artifacts --clobber
 
           git clone --depth 1 \
             "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/${REPO_OWNER}/homebrew-tap.git" \
@@ -104,14 +113,13 @@ jobs:
 
           cat > Casks/dbx.rb <<'RUBY_EOF'
           cask "dbx" do
-            arch arm: "aarch64", intel: "x64"
+            arch arm: "arm64", intel: "x64"
 
             version "__VERSION__"
             sha256 arm:   "__SHA_ARM64__",
                    intel: "__SHA_X64__"
 
-            url "https://github.com/__OWNER__/__APP__/releases/download/v#{version}/__PRODUCT___#{version}_#{arch}.dmg",
-                verified: "github.com/__OWNER__/__APP__/"
+            url "https://github.com/__OWNER__/__APP__/releases/download/v#{version}/__PRODUCT___#{version}_#{arch}.dmg"
             name "DBX"
             desc "Database management tool"
             homepage "https://dbxio.com/"
@@ -138,9 +146,13 @@ jobs:
           sed -i "s/__SHA_ARM64__/${SHA_ARM64}/g" Casks/dbx.rb
           sed -i "s/__SHA_X64__/${SHA_X64}/g" Casks/dbx.rb
 
+          mkdir -p Formula
+          node "$GITHUB_WORKSPACE/.github/scripts/render-mcp-formula.mjs" \
+            "${MCP_VERSION}" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS" Formula/dbx-mcp.rb
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Casks/dbx.rb
+          git add Casks/dbx.rb Formula/dbx-mcp.rb
 
           if git diff --cached --quiet; then
             echo "Homebrew Cask is already up to date."
@@ -238,6 +250,26 @@ jobs:
             --dir assets \
             --clobber
           ls -lh assets/
+
+      - name: Validate latest.json completeness
+        run: |
+          LATEST_JSON="assets/latest.json"
+          if [ ! -f "$LATEST_JSON" ]; then
+            echo "::error::latest.json not found in release assets; refusing to sync an incomplete manifest to R2"
+            exit 1
+          fi
+          MISSING=""
+          for p in darwin-aarch64 darwin-x86_64 windows-x86_64 windows-aarch64 linux-x86_64 linux-aarch64; do
+            if ! jq -e --arg p "$p" '.platforms[$p] != null' "$LATEST_JSON" >/dev/null; then
+              MISSING="${MISSING} ${p}"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::latest.json is missing updater platforms:${MISSING}. Release builds may still be uploading assets; dispatch again after all release jobs finish."
+            exit 1
+          fi
+          echo "Platform manifest complete:"
+          jq -r '.platforms | keys[]' "$LATEST_JSON"
 
       - name: Rewrite latest.json download URLs to R2 CDN
         run: |
@@ -371,7 +403,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Promote prerelease to release
         env:
@@ -470,3 +502,22 @@ jobs:
             -H 'Authorization: Bearer ${ASTRBOT_API_KEY}' \
             -H 'Content-Type: application/json' \
             --data-binary @-"
+
+  notify-feishu:
+    name: Notify Feishu group
+    needs: [promote-release]
+    if: ${{ inputs.notify }}
+    # Card sends after promotion so the title reflects the formal release.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Send release card to Feishu
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
+        run: python3 scripts/notify_feishu.py "${{ github.event.inputs.tag }}"

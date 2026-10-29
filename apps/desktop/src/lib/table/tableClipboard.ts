@@ -18,6 +18,22 @@ export interface TableDataCopyColumnOptions {
   columns: string[];
   postgresOverridingSystemValue: boolean;
   sqlserverIdentityInsert: boolean;
+  damengIdentityInsert: boolean;
+}
+
+export interface TablePasteFeedback {
+  successCount: number;
+  failedCount: number;
+  firstError: unknown;
+}
+
+/** Keep batch paste feedback bounded while preserving the first actionable error. */
+export function tablePasteFeedback(successCount: number, failedCount: number, firstError: unknown): TablePasteFeedback {
+  return {
+    successCount,
+    failedCount,
+    firstError,
+  };
 }
 
 function normalizeSchema(schema: string | null | undefined): string {
@@ -73,19 +89,23 @@ export function tableDataCopyColumnOptions(databaseType: DatabaseType | undefine
     columns: writableColumns.map((column) => column.name),
     postgresOverridingSystemValue: databaseType === "postgres" && writableColumns.some(isIdentityColumn),
     sqlserverIdentityInsert: databaseType === "sqlserver" && writableColumns.some(isIdentityColumn),
+    damengIdentityInsert: databaseType === "dameng" && writableColumns.some(isIdentityColumn),
   };
 }
 
 function isWritableTableDataCopyColumn(databaseType: DatabaseType | undefined, column: ColumnInfo): boolean {
   const extra = (column.extra ?? "").toLowerCase();
   if (databaseType === "mysql") {
-    return !extra.includes("generated");
+    // DEFAULT_GENERATED marks a writable expression default, not a generated column.
+    // Accept both raw EXTRA metadata and the backend's expanded generation clause.
+    return !/\b(?:virtual|stored|persistent)\s+generated\b|\bgenerated\s+always\s+as\s*\(/.test(extra);
   }
   if (databaseType === "postgres") {
     return !extra.includes("generated always as (");
   }
   if (databaseType === "sqlserver") {
-    return !extra.includes("computed");
+    const baseDataType = column.data_type.trim().toLowerCase().split(/[\s(]/, 1)[0] ?? "";
+    return !extra.includes("computed") && baseDataType !== "timestamp" && baseDataType !== "rowversion";
   }
   return !extra.includes("computed") && !(extra.includes("generated") && !extra.includes("identity"));
 }

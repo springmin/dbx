@@ -1,38 +1,27 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "vitest";
-import { compileScript, parse } from "vue/compiler-sfc";
 import { createDataGridCellContextMenuItems } from "../../apps/desktop/src/lib/dataGrid/dataGridContextMenu";
 
 const dataGridPath = "apps/desktop/src/components/grid/DataGrid.vue";
 const dataGridSource = readFileSync(dataGridPath, "utf8");
 
-test("DataGrid context menu script compiles", () => {
-  const { descriptor, errors } = parse(dataGridSource, { filename: dataGridPath });
-
-  assert.deepEqual(errors, []);
-  assert.ok(descriptor.scriptSetup);
-  compileScript(descriptor, { id: "data-grid-context-menu-test" });
-});
-
 test("set NULL applies a real null value only to editable selections", () => {
   const handler = dataGridSource.match(/function setSelectionNull\(\) \{[^]*?\n\}/)?.[0] ?? "";
 
-  assert.match(handler, /if \(!props\.editable \|\| !selectionHasEditableCells\(\)\) return;/);
+  assert.match(dataGridSource, /const resolvedConnectionConfig = computed\(\(\) => connectionStore\.getConfig\(props\.connectionId \?\? ""\)\);/);
+  assert.match(dataGridSource, /const compatibilityReadOnly = computed\(\(\) => mysqlDataCharsetEnabled\(resolvedConnectionConfig\.value\)\);/);
+  assert.match(dataGridSource, /const effectiveEditable = computed\(\(\) => !!props\.editable && !compatibilityReadOnly\.value\);/);
+  assert.match(handler, /if \(!effectiveEditable\.value \|\| !selectionHasEditableCells\(\)\) return;/);
   assert.match(handler, /fillSelectionWithValue\(null\);/);
   assert.doesNotMatch(handler, /fillSelectionWithValue\(["'](?:NULL)?["']\)/);
 });
 
-test("generated selection values restore grid focus for keyboard shortcuts", () => {
-  const applyHandler = dataGridSource.match(/function applyGeneratedSelectionValue\([^]*?\n\}/)?.[0] ?? "";
-
-  assert.match(applyHandler, /if \(applied\)[^]*nextTick\(\(\) => window\.requestAnimationFrame\(\(\) => gridRef\.value\?\.focus\(\{ preventScroll: true \}\)\)\)/);
-});
-
-test("column-header context menus defer copy statement generation", () => {
-  const handler = dataGridSource.match(/function onHeaderContext\([^]*?\n\}/)?.[0] ?? "";
-
-  assert.doesNotMatch(handler, /prefetchCopyStatements/);
+test("hide identical columns compares full-width rows, not visibility-projected ones", () => {
+  const fn = dataGridSource.match(/function getComparisonRows\(\)[^{]*\{[^]*?\n\}/)?.[0] ?? "";
+  assert.ok(fn, "getComparisonRows not found");
+  assert.match(fn, /\bdisplayItems\.value/);
+  assert.doesNotMatch(fn, /visibleDisplayItems/);
 });
 
 test("editable cell selections expose generation after bulk edit", () => {

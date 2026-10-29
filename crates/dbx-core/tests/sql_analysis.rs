@@ -114,7 +114,7 @@ fn extracts_mysql_quoted_table_references() {
     assert_eq!(analysis.tables[0].span.start_line, 1);
     assert_eq!(analysis.tables[0].span.start_column, 15);
     assert_eq!(analysis.tables[0].span.end_line, 1);
-    assert_eq!(analysis.tables[0].span.end_column, 24);
+    assert_eq!(analysis.tables[0].span.end_column, 23);
 }
 
 #[test]
@@ -647,6 +647,35 @@ fn sqlserver_option_functions_and_invalid_hints_are_not_suppressed() {
 }
 
 #[test]
+fn postgres_create_procedure_bodies_do_not_raise_syntax_errors() {
+    let or_replace_with_default_param = "CREATE OR REPLACE PROCEDURE dwd.lzshklx_batch_update_device_id(\n    p_batch_size INT DEFAULT 100,\n    p_total_batches INT DEFAULT NULL\n)\nLANGUAGE plpgsql\nAS $$\nDECLARE\n    v_affected_rows INT;\nBEGIN\n    NULL;\nEND;\n$$;";
+    let plain_dollar_quoted = "CREATE PROCEDURE dwd.foo(p_id INT) LANGUAGE plpgsql AS $tag$ BEGIN NULL; END; $tag$;";
+    let block_comment_separated = "CREATE /* create */ OR /* or */ REPLACE /* replace */ PROCEDURE dwd.foo() LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;";
+    let line_comment_separated = "CREATE -- create\nOR -- or\nREPLACE -- replace\nPROCEDURE dwd.foo() LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;";
+
+    for sql in [or_replace_with_default_param, plain_dollar_quoted, block_comment_separated, line_comment_separated] {
+        let analysis = analyze_sql_references(sql, Some("postgres"))
+            .expect("postgres CREATE PROCEDURE should not surface a false parser error");
+        assert!(analysis.tables.is_empty());
+        assert!(analysis.columns.is_empty());
+    }
+}
+
+#[test]
+fn postgres_create_procedure_syntax_errors_are_not_suppressed() {
+    for sql in [
+        "CREATE PROCEDURE",
+        "CREATE PROCEDURE dwd.foo() LANGUAGE plpgsql AS",
+        "CREATE OR REPLACE PROCEDURE dwd.foo(p_id INT,, p_name TEXT) LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;",
+        "CREATE PROCEDURE dwd.foo() LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$ trailing",
+    ] {
+        let error = analyze_sql_references(sql, Some("postgres"))
+            .expect_err("invalid postgres CREATE PROCEDURE must keep its parser error");
+        assert!(!error.is_empty(), "invalid postgres CREATE PROCEDURE returned an empty error: {sql}");
+    }
+}
+
+#[test]
 fn duckdb_parser_gap_queries_do_not_raise_syntax_errors() {
     for sql in ["FROM users;", "SUMMARIZE users;", "SUMMARISE users;"] {
         let analysis = analyze_sql_references(sql, Some("duckdb")).expect("duckdb parser gap query should analyze");
@@ -666,4 +695,166 @@ fn clickhouse_strictness_first_left_joins_do_not_raise_syntax_errors() {
             analysis.tables.iter().map(|table| (table.name.as_str(), table.alias.as_deref())).collect();
         assert_eq!(tables, vec![("events", Some("a")), ("wallets", Some("b"))]);
     }
+}
+
+#[test]
+fn spark_datasource_create_table_supports_iceberg_clauses() {
+    let sql = r#"CREATE TABLE account_flow (
+  id STRING,
+  databasename STRING,
+  created TIMESTAMP
+)
+USING iceberg
+PARTITIONED BY (databasename, truncate(created, 7))
+COMMENT '账户流水表'
+TBLPROPERTIES (
+  'format-version' = '2',
+  'snapshot.base.keep.minutes' = '1440',
+  'self-optimizing.group' = 'supbig',
+  'write.metadata.delete-after-commit.enabled' = 'true',
+  'write.metadata.previous-versions-max' = '3',
+  'clean-orphan-file.enabled' = 'true',
+  'clean-orphan-file.min-existing-time-minutes' = '1440',
+  'primary-key' = 'id,databasename',
+  'table.drop-base-path.enabled' = 'true'
+);"#;
+
+    let analysis = analyze_sql_references(sql, Some("spark"))
+        .unwrap_or_else(|error| panic!("Spark datasource CREATE TABLE should analyze: {error}"));
+
+    assert!(analysis.tables.is_empty());
+    assert!(analysis.columns.is_empty());
+}
+
+#[test]
+fn spark_datasource_ctas_preserves_query_references() {
+    let sql = "CREATE TABLE account_flow USING iceberg PARTITIONED BY (id) TBLPROPERTIES ('format-version' = '2') AS SELECT s.id FROM source_flow s";
+    let analysis = analyze_sql_references(sql, Some("spark")).expect("Spark datasource CTAS should analyze");
+
+    let tables: Vec<_> = analysis.tables.iter().map(|table| (table.name.as_str(), table.alias.as_deref())).collect();
+    assert_eq!(tables, vec![("source_flow", Some("s"))]);
+    assert_eq!(analysis.tables[0].span.start_column, sql.find("source_flow").expect("source table") + 1);
+    assert_eq!(analysis.columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>(), vec!["id"]);
+}
+
+#[test]
+fn spark_datasource_create_table_validates_options_and_properties() {
+    let sql = "CREATE TABLE account_flow (id STRING) USING iceberg TBLPROPERTIES ('format-version' = '2') COMMENT 'account flow' PARTITIONED BY (id) OPTIONS ('merge-schema' = 'true')";
+    let analysis =
+        analyze_sql_references(sql, Some("spark")).expect("reordered Spark datasource clauses should analyze");
+
+    assert!(analysis.tables.is_empty());
+    assert!(analysis.columns.is_empty());
+}
+
+#[test]
+fn spark_datasource_create_table_rejects_duplicate_clauses() {
+    let duplicate_sql = [
+        "CREATE TABLE broken (id STRING) USING iceberg OPTIONS ('a' = '1') OPTIONS ('b' = '2')",
+        "CREATE TABLE broken (id STRING) USING iceberg PARTITIONED BY (id) PARTITIONED BY (id)",
+        "CREATE TABLE broken (id STRING) USING iceberg COMMENT 'first' COMMENT 'second'",
+        "CREATE TABLE broken (id STRING) USING iceberg TBLPROPERTIES ('a' = '1') TBLPROPERTIES ('b' = '2')",
+    ];
+
+    let accepted: Vec<_> =
+        duplicate_sql.iter().copied().filter(|sql| analyze_sql_references(sql, Some("spark")).is_ok()).collect();
+    assert!(accepted.is_empty(), "duplicate Spark datasource clauses were accepted: {accepted:?}");
+}
+
+#[test]
+fn spark_datasource_create_table_keeps_syntax_errors() {
+    for sql in [
+        "CREATE TABLE broken (id STRING) USING",
+        "CREATE TABLE broken (id STRING) USING 'iceberg'",
+        "CREATE TABLE broken (id STRING USING iceberg",
+        "CREATE TABLE broken (id STRING, created TIMESTAMP) USING iceberg PARTITIONED BY (truncate(created 7))",
+        "CREATE TABLE broken (id STRING, created TIMESTAMP) USING iceberg PARTITIONED BY (created) UNKNOWN CLAUSE",
+        "CREATE TABLE broken (id STRING) USING iceberg OPTIONS ('merge-schema')",
+        "CREATE TABLE broken (id STRING) USING iceberg TBLPROPERTIES ('format-version')",
+    ] {
+        let error = analyze_sql_references(sql, Some("spark"))
+            .expect_err(&format!("malformed Spark datasource CREATE TABLE must keep its parser error: {sql}"));
+        assert!(!error.is_empty());
+    }
+
+    let provider_error = analyze_sql_references("CREATE TABLE broken (id STRING) USING 'iceberg'", Some("spark"))
+        .expect_err("quoted Spark datasource provider must remain invalid");
+    assert!(provider_error.contains("Line: 1, Column:"));
+}
+
+#[test]
+fn spark_selects_still_report_query_references() {
+    let analysis = analyze_sql_references("SELECT s.id FROM source_flow s", Some("spark"))
+        .expect("ordinary Spark SELECT should analyze");
+
+    assert_eq!(analysis.tables[0].name, "source_flow");
+    assert_eq!(analysis.tables[0].alias.as_deref(), Some("s"));
+    assert_eq!(analysis.columns[0].name, "id");
+}
+
+#[test]
+fn generic_dialect_still_rejects_spark_datasource_clauses() {
+    let error = analyze_sql_references("CREATE TABLE account_flow (id STRING) USING iceberg", Some("generic"))
+        .expect_err("Spark datasource clauses must remain dialect-specific");
+
+    assert!(error.contains("USING"));
+}
+
+#[test]
+fn oracle_admin_ddl_statements_do_not_raise_syntax_errors() {
+    for sql in [
+        "create user dbx_tmp identified by \"pw\" account unlock;",
+        "alter user dbx_tmp identified by \"pw\";",
+        "alter user dbx_tmp default tablespace dbx_ts;",
+        "create tablespace dbx_ts datafile '/tmp/dbx_ts.dbf' size 10m autoextend on next 1m maxsize unlimited;",
+        "alter tablespace dbx_ts add datafile '/tmp/dbx_ts2.dbf' size 5m;",
+        "drop tablespace dbx_ts including contents and datafiles;",
+        "create profile dbx_prof limit failed_login_attempts 5;",
+        "create directory dbx_dir as '/tmp/dbx_dir';",
+        "create or replace public synonym dbx_syn for dual;",
+        "alter session set nls_date_format='YYYY-MM-DD';",
+        "grant create session to dbx_tmp;",
+        "revoke create session from dbx_tmp;",
+    ] {
+        let analysis = analyze_sql_references(sql, Some("oracle"))
+            .unwrap_or_else(|error| panic!("Oracle admin DDL should analyze: {error} ({sql})"));
+        assert!(analysis.tables.is_empty(), "unexpected table references for {sql}");
+        assert!(analysis.columns.is_empty(), "unexpected column references for {sql}");
+    }
+}
+
+#[test]
+fn oracle_admin_ddl_masking_keeps_following_statement_spans() {
+    let sql =
+        "select 1 from users;\ncreate user dbx_tmp identified by \"pw\" account unlock;\nselect u.id from users u;";
+
+    let analysis = analyze_sql_references(sql, Some("oracle"))
+        .unwrap_or_else(|error| panic!("masked Oracle admin DDL should analyze: {error}"));
+
+    let tables: Vec<_> = analysis.tables.iter().map(|table| (table.name.as_str(), table.scope_id)).collect();
+    assert_eq!(tables, vec![("users", 0), ("users", 1)]);
+    // The trailing statement keeps the exact line/column it had in the unmasked script
+    // ("users" starts after `select u.id from ` on line 3).
+    assert_eq!(analysis.tables[1].span.start_line, 3);
+    assert_eq!(analysis.tables[1].span.start_column, 18);
+
+    let columns: Vec<_> = analysis.columns.iter().map(|column| column.name.as_str()).collect();
+    assert_eq!(columns, vec!["id"]);
+    assert_eq!(analysis.columns[0].span.start_line, 3);
+}
+
+#[test]
+fn oracle_admin_ddl_tolerance_is_scoped_to_oracle_compatible_dialects() {
+    for dialect in [Some("generic"), Some("postgres"), Some("mysql"), None] {
+        let error = analyze_sql_references("create user dbx_tmp identified by \"pw\";", dialect)
+            .expect_err("non Oracle dialects must keep the parser error");
+        assert!(!error.is_empty());
+    }
+}
+
+#[test]
+fn oracle_syntax_errors_are_still_reported() {
+    let error = analyze_sql_references("select from where order;", Some("oracle"))
+        .expect_err("a real Oracle syntax error must still be reported");
+    assert!(error.contains("sql parser error"), "unexpected error: {error}");
 }

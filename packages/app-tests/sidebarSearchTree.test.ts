@@ -319,9 +319,37 @@ test("omits synthetic connection management entries when the connection itself m
           database: "",
         },
         {
+          id: "conn:1:__dameng_users",
+          label: "tree.damengUsers",
+          type: "dameng-users",
+          connectionId: "conn:1",
+          database: "",
+        },
+        {
+          id: "conn:1:__dameng_roles",
+          label: "tree.damengRoles",
+          type: "dameng-roles",
+          connectionId: "conn:1",
+          database: "",
+        },
+        {
           id: "conn:1:__dameng_jobs",
           label: "tree.damengJobAdmin",
           type: "dameng-job-admin",
+          connectionId: "conn:1",
+          database: "",
+        },
+        {
+          id: "conn:1:__xugu_tablespaces",
+          label: "tree.xuguTablespaces",
+          type: "group-tablespaces",
+          connectionId: "conn:1",
+          database: "",
+        },
+        {
+          id: "conn:1:__oracle_db_links",
+          label: "tree.databaseLinks",
+          type: "oracle-db-links",
           connectionId: "conn:1",
           database: "",
         },
@@ -354,6 +382,14 @@ test("keeps a disconnected connection search result collapsed when it only has s
           connectionId: "conn:1",
           database: "",
         },
+        {
+          id: "conn:1:__oracle_db_links",
+          label: "tree.databaseLinks",
+          type: "oracle-db-links",
+          connectionId: "conn:1",
+          database: "",
+          children: [],
+        },
       ],
     },
   ];
@@ -362,6 +398,79 @@ test("keeps a disconnected connection search result collapsed when it only has s
 
   assert.deepEqual(filtered[0]?.children, []);
   assert.equal(filtered[0]?.isExpanded, false);
+});
+
+test("keeps utility groups searchable through their real object children", () => {
+  const nodes: TreeNode[] = [
+    {
+      id: "conn:1",
+      label: "prod",
+      type: "connection",
+      connectionId: "conn:1",
+      isExpanded: true,
+      children: [
+        {
+          id: "conn:1:__oracle_db_links",
+          label: "tree.databaseLinks",
+          type: "oracle-db-links",
+          connectionId: "conn:1",
+          database: "",
+          children: [
+            {
+              id: "conn:1:__oracle_db_links:reporting",
+              label: "REPORTING.LOCALDOMAIN",
+              type: "oracle-db-link",
+              connectionId: "conn:1",
+              database: "",
+            },
+          ],
+        },
+      ],
+    },
+  ];
+
+  const filtered = filterSidebarTree(nodes, "reporting", new Set());
+
+  assert.equal(filtered[0]?.type, "connection");
+  assert.deepEqual(
+    filtered[0]?.children?.map((child) => child.type),
+    ["oracle-db-links"],
+  );
+  assert.equal(filtered[0]?.children?.[0]?.children?.[0]?.label, "REPORTING.LOCALDOMAIN");
+});
+
+test("drops utility groups whose children do not match the query", () => {
+  const nodes: TreeNode[] = [
+    {
+      id: "conn:1",
+      label: "prod",
+      type: "connection",
+      connectionId: "conn:1",
+      isExpanded: true,
+      children: [
+        {
+          id: "conn:1:__xugu_tablespaces",
+          label: "tree.xuguTablespaces",
+          type: "group-tablespaces",
+          connectionId: "conn:1",
+          database: "",
+          children: [
+            {
+              id: "conn:1:__xugu_tablespaces:system",
+              label: "SYSTEM",
+              type: "tablespace",
+              connectionId: "conn:1",
+              database: "",
+            },
+          ],
+        },
+      ],
+    },
+  ];
+
+  const filtered = filterSidebarTree(nodes, "reporting", new Set());
+
+  assert.deepEqual(filtered, []);
 });
 
 test("does not return synthetic connection management entries as direct text matches", () => {
@@ -1157,4 +1266,104 @@ test("connection search copies preserve loading state", () => {
 
   assert.equal(filtered[0]?.type, "connection");
   assert.equal(filtered[0]?.isLoading, true);
+});
+
+test("preserves unloaded connections and connection-groups when filtering by database or table type without text query (#13741)", () => {
+  const unopenedConnection: TreeNode = {
+    id: "conn:unopened",
+    label: "350A(MySQL)",
+    type: "connection",
+    connectionId: "conn:unopened",
+    isExpanded: false,
+    children: [],
+  };
+  const groupedConnection: TreeNode = {
+    id: "conn:grouped",
+    label: "Local-Oracle",
+    type: "connection",
+    connectionId: "conn:grouped",
+    isExpanded: false,
+    children: [],
+  };
+  const group: TreeNode = {
+    id: "group:navicat",
+    label: "Navicat",
+    type: "connection-group",
+    isExpanded: true,
+    children: [groupedConnection],
+  };
+  const nodes = [group, unopenedConnection];
+
+  // Filtering by database type keeps unloaded connections so the user can open them
+  const filteredByDb = filterSidebarTree(nodes, "", new Set(), new Set(["database"]));
+  assert.equal(filteredByDb.length, 2);
+  assert.equal(filteredByDb[0]?.id, "group:navicat");
+  assert.equal(filteredByDb[0]?.children?.[0]?.id, "conn:grouped");
+  assert.equal(filteredByDb[1]?.id, "conn:unopened");
+
+  // Filtering by table type also keeps unloaded connections
+  const filteredByTable = filterSidebarTree(nodes, "", new Set(), new Set(["table"]));
+  assert.equal(filteredByTable.length, 2);
+  assert.equal(filteredByTable[0]?.id, "group:navicat");
+  assert.equal(filteredByTable[1]?.id, "conn:unopened");
+
+  // However, searching for a non-matching text query still filters them out
+  const filteredWithQuery = filterSidebarTree(nodes, "nonexistent", new Set(), new Set(["database"]));
+  assert.equal(filteredWithQuery.length, 0);
+});
+
+test("preserves unexpanded database containers when filtering by table type without text query (#13741)", () => {
+  const unexpandedDb: TreeNode = {
+    id: "conn:1:db:unexpanded",
+    label: "unexpanded_db",
+    type: "database",
+    connectionId: "conn:1",
+    database: "unexpanded_db",
+    isExpanded: false,
+    children: [],
+  };
+  const expandedDbWithTable: TreeNode = {
+    id: "conn:1:db:expanded",
+    label: "expanded_db",
+    type: "database",
+    connectionId: "conn:1",
+    database: "expanded_db",
+    isExpanded: true,
+    children: [
+      {
+        id: "conn:1:db:expanded:users",
+        label: "users",
+        type: "table",
+        connectionId: "conn:1",
+        database: "expanded_db",
+      },
+      {
+        id: "conn:1:db:expanded:user_view",
+        label: "user_view",
+        type: "view",
+        connectionId: "conn:1",
+        database: "expanded_db",
+      },
+    ],
+  };
+  const conn: TreeNode = {
+    id: "conn:1",
+    label: "MySQL",
+    type: "connection",
+    connectionId: "conn:1",
+    isExpanded: true,
+    children: [unexpandedDb, expandedDbWithTable],
+  };
+
+  const filtered = filterSidebarTree([conn], "", new Set(), new Set(["table"]));
+  assert.equal(filtered.length, 1);
+  assert.equal(filtered[0]?.children?.length, 2);
+  // Unexpanded database is kept as an unloaded table container
+  assert.equal(filtered[0]?.children?.[0]?.id, "conn:1:db:unexpanded");
+  // Expanded database is kept, but only its tables survive (views pruned)
+  assert.equal(filtered[0]?.children?.[1]?.id, "conn:1:db:expanded");
+  assert.deepEqual(
+    filtered[0]?.children?.[1]?.children?.map((child) => child.label),
+    ["users"],
+  );
 });

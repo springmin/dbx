@@ -11,8 +11,11 @@ import type {
   TopicRef,
   TopicInfo,
   ListTopicsOpts,
+  MqListPage,
+  MqListPageRequest,
   TopicStats,
   SubscriptionInfo,
+  KafkaConsumerGroupSnapshot,
   ResetPosition,
   SkipCount,
   ConsumerInfo,
@@ -72,6 +75,10 @@ export async function mqTestConnection(connectionId: string): Promise<MqClusterI
 
 export async function mqListExchanges(connectionId: string, ns: NamespaceRef): Promise<MqExchangeInfo[]> {
   return post("/api/mq/exchanges/list", { connectionId, ns });
+}
+
+export async function mqListExchangesPage(connectionId: string, ns: NamespaceRef, pagination: MqListPageRequest): Promise<MqListPage<MqExchangeInfo>> {
+  return post("/api/mq/exchanges/list-page", { connectionId, ns, pagination });
 }
 
 export async function mqCreateExchange(connectionId: string, ns: NamespaceRef, exchange: MqExchangeCreateRequest): Promise<void> {
@@ -193,6 +200,10 @@ export async function mqListTopics(connectionId: string, ns: NamespaceRef, opts:
   return post("/api/mq/topics/list", { connectionId, ns, opts });
 }
 
+export async function mqListTopicsPage(connectionId: string, ns: NamespaceRef, opts: ListTopicsOpts, pagination: MqListPageRequest): Promise<MqListPage<TopicInfo>> {
+  return post("/api/mq/topics/list-page", { connectionId, ns, opts, pagination });
+}
+
 export async function mqCreateTopic(connectionId: string, topic: TopicRef, partitions?: number): Promise<void> {
   return post("/api/mq/topics/create", { connectionId, topic, partitions });
 }
@@ -219,6 +230,10 @@ export async function mqListSubscriptions(connectionId: string, topic: TopicRef)
 
 export async function mqEnrichSubscriptions(connectionId: string, topic: TopicRef): Promise<SubscriptionInfo[]> {
   return post("/api/mq/subscriptions/enrich", { connectionId, topic });
+}
+
+export async function mqGetKafkaConsumerGroupSnapshot(connectionId: string): Promise<KafkaConsumerGroupSnapshot> {
+  return post("/api/mq/kafka/consumer-groups", { connectionId });
 }
 
 export async function mqCreateSubscription(connectionId: string, topic: TopicRef, sub: string, pos: ResetPosition): Promise<void> {

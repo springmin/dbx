@@ -38,6 +38,7 @@ export interface NacosServiceCapabilities {
   deleteService: NacosOperationCapability;
   listInstances: NacosOperationCapability;
   updateInstance: NacosOperationCapability;
+  updateInstanceHealth?: NacosOperationCapability;
   registerInstance: NacosOperationCapability;
   deregisterInstance: NacosOperationCapability;
 }
@@ -241,14 +242,18 @@ export interface NacosAuthConfig {
 
 export type NacosImplementation = "nacos" | "rnacos";
 export type NacosVersionMode = "auto" | "v2" | "v3";
+export type NacosApiPlane = "admin" | "console";
 export type NacosMetricsMode = "auto" | "disabled" | "custom";
 export type NacosRNacosConsoleAuth = { kind: "inherit" } | { kind: "usernamePassword"; username: string; password: string };
 
 export interface NacosAdminConfig {
   implementation?: NacosImplementation;
   versionMode?: NacosVersionMode;
+  apiPlane?: NacosApiPlane;
   serverAddr: string;
   contextPath?: string;
+  /** Browser URL for the Nacos web console. Nacos 3 uses a separate console endpoint. */
+  consoleUrl?: string;
   /** Namespace IDs used when an official Nacos ordinary user cannot enumerate namespaces or authorization data. */
   managedNamespaces?: string[];
   rnacosConsoleAddr?: string;
@@ -353,12 +358,19 @@ export interface NacosConfigSelector {
 
 export type NacosConflictPolicy = "ABORT" | "SKIP" | "OVERWRITE";
 
+export interface NacosBatchPreviewDiff {
+  beforeContent: string;
+  afterContent: string;
+  format?: string;
+}
+
 export interface NacosBatchPreviewItem {
   namespace: string;
   group: string;
   dataId: string;
   status: string;
   message?: string;
+  diff?: NacosBatchPreviewDiff;
 }
 
 export interface NacosBatchPreview {
@@ -394,6 +406,12 @@ export interface NacosBatchReport {
   items: NacosBatchItemResult[];
 }
 
+export interface NacosConfigDataIdMapping {
+  sourceGroup: string;
+  sourceDataId: string;
+  targetDataId: string;
+}
+
 export interface NacosConfigTransferRequest {
   operationId: string;
   sourceConnectionId: string;
@@ -401,6 +419,7 @@ export interface NacosConfigTransferRequest {
   source: NacosConfigSelector;
   targetNamespace: string;
   targetGroup?: string;
+  dataIdMappings?: NacosConfigDataIdMapping[];
   conflictPolicy: NacosConflictPolicy;
 }
 
@@ -446,6 +465,8 @@ export interface NacosConfigUpsert extends NacosConfigKey {
   appName?: string;
   desc?: string;
   tags?: string;
+  /** Publish only while the server still holds this MD5. */
+  casMd5?: string;
 }
 
 export interface NacosConfigHistoryQuery extends NacosConfigKey {

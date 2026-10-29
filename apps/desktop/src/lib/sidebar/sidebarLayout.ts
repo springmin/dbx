@@ -107,6 +107,55 @@ export function reconcileLayout(connectionIds: string[], layout: SidebarLayout |
   return { groups, order };
 }
 
+/**
+ * Keep only the selected connections and drop groups that become empty.
+ * Unlike {@link reconcileLayout}, missing selected ids are not appended as
+ * ungrouped leftovers — the caller already owns the selected set.
+ */
+export function filterSidebarLayoutByConnectionIds(layout: SidebarLayout | null | undefined, connectionIds: Iterable<string>): SidebarLayout {
+  const selectedIds = Array.from(new Set(Array.from(connectionIds).filter((id) => id.length > 0)));
+  if (!layout) {
+    return {
+      groups: [],
+      order: selectedIds.map((id) => ({ type: "connection" as const, id })),
+    };
+  }
+
+  const validIds = new Set(selectedIds);
+  const validGroups = new Set(layout.groups.map((group) => group.id));
+  const seenConnections = new Set<string>();
+  const seenGroups = new Set<string>();
+
+  const prune = (entry: SidebarOrderEntry): SidebarOrderEntry | null => {
+    if (entry.type === "connection") {
+      if (!validIds.has(entry.id) || seenConnections.has(entry.id)) return null;
+      seenConnections.add(entry.id);
+      return { type: "connection", id: entry.id };
+    }
+    if (!validGroups.has(entry.id) || seenGroups.has(entry.id)) return null;
+    seenGroups.add(entry.id);
+    const children = entryChildren(entry).map(prune).filter(Boolean) as SidebarOrderEntry[];
+    if (!children.length) return null;
+    return { type: "group", id: entry.id, children };
+  };
+
+  const order = layout.order.map(prune).filter(Boolean) as SidebarOrderEntry[];
+  const usedGroupIds = new Set<string>();
+  const collectGroups = (entries: SidebarOrderEntry[]) => {
+    for (const entry of entries) {
+      if (entry.type !== "group") continue;
+      usedGroupIds.add(entry.id);
+      collectGroups(entry.children ?? []);
+    }
+  };
+  collectGroups(order);
+
+  return {
+    groups: layout.groups.filter((group) => usedGroupIds.has(group.id)).map((group) => ({ ...group })),
+    order,
+  };
+}
+
 export function remapSidebarLayoutConnectionIds(layout: SidebarLayout, connectionIdMap: Map<string, string>): SidebarLayout {
   const remapEntries = (entries: SidebarOrderEntry[]): SidebarOrderEntry[] =>
     entries.flatMap((entry): SidebarOrderEntry[] => {
@@ -286,6 +335,62 @@ export function buildConnectionGroupPathMap(layout: SidebarLayout): Map<string, 
 
   visit(layout.order, []);
   return paths;
+}
+
+/** Build root-to-leaf stable group-id paths for permission inheritance. */
+export function buildConnectionGroupIdPathMap(layout: SidebarLayout): Map<string, string[]> {
+  const paths = new Map<string, string[]>();
+
+  const visit = (entries: SidebarOrderEntry[], path: string[]) => {
+    for (const entry of entries) {
+      if (entry.type === "connection") {
+        paths.set(entry.id, path);
+        continue;
+      }
+      visit(entryChildren(entry), [...path, entry.id]);
+    }
+  };
+
+  visit(layout.order, []);
+  return paths;
+}
+
+export interface ConnectionGroupDestinationRow {
+  id: string;
+  name: string;
+  depth: number;
+  path: string[];
+}
+
+/** Build selectable connection-group destinations in the same tree order as the sidebar. */
+export function connectionGroupDestinationRows(layout: SidebarLayout): ConnectionGroupDestinationRow[] {
+  const groupMap = new Map(layout.groups.map((group) => [group.id, group]));
+  const rows: ConnectionGroupDestinationRow[] = [];
+  const seen = new Set<string>();
+
+  const visit = (entries: SidebarOrderEntry[], parentPath: string[]) => {
+    for (const entry of entries) {
+      if (entry.type !== "group" || seen.has(entry.id)) continue;
+      const group = groupMap.get(entry.id);
+      if (!group) continue;
+
+      seen.add(entry.id);
+      const path = [...parentPath, group.name];
+      rows.push({ id: group.id, name: group.name, depth: parentPath.length, path });
+      visit(entryChildren(entry), path);
+    }
+  };
+
+  visit(layout.order, []);
+  return rows;
+}
+
+/** Resolve the group implied by a selected group, connection, or descendant node. */
+export function connectionGroupIdForSelection(layout: SidebarLayout, selectedNodeId?: string | null, selectedConnectionId?: string | null): string | null {
+  if (selectedNodeId && connectionGroupDestinationRows(layout).some((group) => group.id === selectedNodeId)) return selectedNodeId;
+  const connectionId = selectedConnectionId || selectedNodeId;
+  if (!connectionId) return null;
+  return findConnectionLocation(layout, connectionId)?.groupId ?? null;
 }
 
 function findGroupEntry(entries: SidebarOrderEntry[], groupId: string): Extract<SidebarOrderEntry, { type: "group" }> | null {
@@ -542,9 +647,30 @@ export function deleteGroup(layout: SidebarLayout, groupId: string): SidebarLayo
 }
 
 export function toggleGroupCollapsed(layout: SidebarLayout, groupId: string): SidebarLayout {
+  const targetGroup = layout.groups.find((group) => group.id === groupId);
+  const willCollapse = targetGroup ? !targetGroup.collapsed : false;
+  if (!willCollapse) {
+    return {
+      ...layout,
+      groups: layout.groups.map((group) => (group.id === groupId ? { ...group, collapsed: false } : group)),
+    };
+  }
+
+  const groupEntry = findGroupEntry(layout.order, groupId);
+  const descendantGroupIds = new Set<string>();
+  const collectDescendants = (entry: Extract<SidebarOrderEntry, { type: "group" }>) => {
+    for (const child of entryChildren(entry)) {
+      if (child.type === "group") {
+        descendantGroupIds.add(child.id);
+        collectDescendants(child);
+      }
+    }
+  };
+  if (groupEntry) collectDescendants(groupEntry);
+
   return {
     ...layout,
-    groups: layout.groups.map((group) => (group.id === groupId ? { ...group, collapsed: !group.collapsed } : group)),
+    groups: layout.groups.map((group) => (group.id === groupId || descendantGroupIds.has(group.id) ? { ...group, collapsed: true } : group)),
   };
 }
 

@@ -37,4 +37,88 @@ describe("data grid column lookup search", () => {
   it("returns all columns for an empty query", () => {
     expect(filterDataGridColumnLookupItems(items, " ")).toEqual(items);
   });
+
+  it("keeps grouped comments aligned by result ordinal and searches them", () => {
+    const groupedItems = buildDataGridColumnLookupItems({
+      columns: ["label", "label", "total"],
+      columnComments: ["Primary label", "Joined label", undefined],
+      commentByColumn: new Map([
+        ["label", "Wrong name-based label"],
+        ["total", "Wrong aggregate label"],
+      ]),
+    });
+
+    expect(groupedItems.map((item) => item.comment)).toEqual(["Primary label", "Joined label", undefined]);
+    expect(filterDataGridColumnLookupItems(groupedItems, "joined").map((item) => item.index)).toEqual([1]);
+    expect(filterDataGridColumnLookupItems(groupedItems, "wrong")).toEqual([]);
+  });
+
+  it("falls back to source metadata only when ordinal comments are absent", () => {
+    const comments = new Map([
+      ["department", "Department name"],
+      ["total", "Unsafe aggregate fallback"],
+    ]);
+
+    expect(
+      buildDataGridColumnLookupItems({
+        columns: ["dept"],
+        sourceColumns: ["department"],
+        commentByColumn: comments,
+      }),
+    ).toMatchObject([{ comment: "Department name" }]);
+    expect(
+      buildDataGridColumnLookupItems({
+        columns: ["total"],
+        columnComments: [undefined],
+        commentByColumn: comments,
+      }),
+    ).toEqual([{ index: 0, name: "total" }]);
+  });
+
+  it("ranks prefix matches ahead of distant fuzzy subsequence matches (issue #13045)", () => {
+    const lookupItems = buildDataGridColumnLookupItems({
+      columns: ["iiitdjdahg", "tagunique"],
+    });
+
+    const result = filterDataGridColumnLookupItems(lookupItems, "tag");
+    expect(result.map((item) => item.name)).toEqual(["tagunique", "iiitdjdahg"]);
+  });
+
+  it("ranks exact match ahead of prefix, substring, and fuzzy matches", () => {
+    const lookupItems = buildDataGridColumnLookupItems({
+      columns: ["tag_id", "contain_tag", "tag", "iiitdjdahg"],
+    });
+
+    const result = filterDataGridColumnLookupItems(lookupItems, "tag");
+    expect(result.map((item) => item.name)).toEqual(["tag", "tag_id", "contain_tag", "iiitdjdahg"]);
+  });
+
+  it("ranks column name matches ahead of comment matches", () => {
+    const lookupItems = buildDataGridColumnLookupItems({
+      columns: ["status", "category"],
+      columnComments: ["category type", "status code"],
+    });
+
+    const result = filterDataGridColumnLookupItems(lookupItems, "category");
+    expect(result.map((item) => item.name)).toEqual(["category", "status"]);
+  });
+
+  it("breaks ties with original column order", () => {
+    const lookupItems = buildDataGridColumnLookupItems({
+      columns: ["tag_one", "tag_two", "tag_six"],
+    });
+
+    const result = filterDataGridColumnLookupItems(lookupItems, "tag_");
+    expect(result.map((item) => item.name)).toEqual(["tag_one", "tag_two", "tag_six"]);
+  });
+
+  it("ranks name matches ahead of sourceName matches in exact mode", () => {
+    const lookupItems = buildDataGridColumnLookupItems({
+      columns: ["alias_tag", "tag"],
+      sourceColumns: ["tag", "physical_tag"],
+    });
+
+    const result = filterDataGridColumnLookupItems(lookupItems, "tag", "exact");
+    expect(result.map((item) => item.name)).toEqual(["tag", "alias_tag"]);
+  });
 });

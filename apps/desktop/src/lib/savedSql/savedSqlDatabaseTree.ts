@@ -11,6 +11,7 @@ function savedSqlCopySortKey(name: string): { base: string; copyIndex: number } 
 }
 
 function compareSavedSqlFiles(left: SavedSqlFile, right: SavedSqlFile): number {
+  if (!!left.isDefaultQuery !== !!right.isDefaultQuery) return left.isDefaultQuery ? -1 : 1;
   const leftKey = savedSqlCopySortKey(left.name);
   const rightKey = savedSqlCopySortKey(right.name);
   return savedSqlNameCollator.compare(leftKey.base, rightKey.base) || leftKey.copyIndex - rightKey.copyIndex || savedSqlNameCollator.compare(left.name, right.name) || left.id.localeCompare(right.id);
@@ -42,8 +43,8 @@ export function indexSavedSqlFilesByDatabase(files: readonly SavedSqlFile[]): Sa
   return index;
 }
 
-export function savedSqlFilesForDatabase(source: SavedSqlDatabaseSource, scope: SavedSqlDatabaseScope): SavedSqlFile[] {
-  if (!Array.isArray(source)) return [...((source as SavedSqlDatabaseIndex).get(savedSqlDatabaseScopeKey(scope)) ?? [])];
+export function savedSqlFilesForDatabase(source: SavedSqlDatabaseSource, scope: SavedSqlDatabaseScope): readonly SavedSqlFile[] {
+  if (!Array.isArray(source)) return (source as SavedSqlDatabaseIndex).get(savedSqlDatabaseScopeKey(scope)) ?? [];
   return source.filter((file) => savedSqlDatabaseScopeKey(file) === savedSqlDatabaseScopeKey(scope)).sort(compareSavedSqlFiles);
 }
 
@@ -60,7 +61,7 @@ function savedSqlFileNode(rootId: string, file: SavedSqlFile): TreeNode {
   };
 }
 
-export function buildDatabaseSavedSqlRootNode(databaseNode: Pick<TreeNode, "id" | "connectionId" | "catalog" | "database">, source: SavedSqlDatabaseSource, existingRoot?: TreeNode): TreeNode | null {
+export function buildDatabaseSavedSqlRootNode(databaseNode: Pick<TreeNode, "id" | "connectionId" | "catalog" | "database" | "schema">, source: SavedSqlDatabaseSource, existingRoot?: TreeNode): TreeNode | null {
   if (!databaseNode.connectionId || databaseNode.database === undefined) return null;
 
   const id = `${databaseNode.id}:__queries`;
@@ -71,7 +72,10 @@ export function buildDatabaseSavedSqlRootNode(databaseNode: Pick<TreeNode, "id" 
     connectionId: databaseNode.connectionId,
     catalog: databaseNode.catalog,
     database: databaseNode.database,
-    isExpanded: existingRoot?.isExpanded ?? true,
+    schema: databaseNode.schema,
+    // Default collapsed: opening a connection should not expand the Queries
+    // node until the user asks for it; an existing node's state is preserved.
+    isExpanded: existingRoot?.isExpanded ?? false,
     children: savedSqlFilesForDatabase(source, {
       connectionId: databaseNode.connectionId,
       catalog: databaseNode.catalog,
@@ -80,10 +84,29 @@ export function buildDatabaseSavedSqlRootNode(databaseNode: Pick<TreeNode, "id" 
   };
 }
 
-export function withDatabaseSavedSqlRoot(databaseNode: Pick<TreeNode, "id" | "connectionId" | "catalog" | "database" | "children">, children: readonly TreeNode[], source: SavedSqlDatabaseSource): TreeNode[] {
+export function withDatabaseSavedSqlRoot(databaseNode: Pick<TreeNode, "id" | "connectionId" | "catalog" | "database" | "schema" | "children">, children: readonly TreeNode[], source: SavedSqlDatabaseSource): TreeNode[] {
   const existingRoot = databaseNode.children?.find((child) => child.type === "saved-sql-root");
-  const root = buildDatabaseSavedSqlRootNode(databaseNode, source, existingRoot);
+  const existingMetadataChildren = databaseNode.children?.filter((child) => child.type !== "saved-sql-root") ?? [];
   const metadataChildren = children.filter((child) => child.type !== "saved-sql-root");
+  const files =
+    databaseNode.connectionId && databaseNode.database !== undefined
+      ? savedSqlFilesForDatabase(source, {
+          connectionId: databaseNode.connectionId,
+          catalog: databaseNode.catalog,
+          database: databaseNode.database,
+        })
+      : [];
+  const sameMetadata = metadataChildren.length === existingMetadataChildren.length && metadataChildren.every((node, index) => node === existingMetadataChildren[index]);
+  const sameFiles =
+    !!existingRoot &&
+    existingRoot.children?.length === files.length &&
+    files.every((file, index) => {
+      const node = existingRoot.children?.[index];
+      return node?.type === "saved-sql-file" && node.savedSqlId === file.id && node.label === file.name && node.connectionId === file.connectionId && node.catalog === file.catalog && node.database === file.database && node.schema === file.schema;
+    });
+  if (existingRoot && sameMetadata && sameFiles) return databaseNode.children ? [...databaseNode.children] : metadataChildren;
+
+  const root = buildDatabaseSavedSqlRootNode(databaseNode, source, existingRoot);
   return root ? [...metadataChildren, root] : metadataChildren;
 }
 

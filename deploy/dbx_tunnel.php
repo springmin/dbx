@@ -21,6 +21,18 @@ $DBX_TUNNEL_DIR = getenv('DBX_TUNNEL_DIR') ?: sys_get_temp_dir() . DIRECTORY_SEP
 $DBX_TUNNEL_ALLOWED_HOSTS = array_values(array_filter(array_map('trim', explode(',', getenv('DBX_TUNNEL_ALLOWED_HOSTS') ?: ''))));
 $DBX_TUNNEL_MAX_SESSION_SECONDS = max(30, (int) (getenv('DBX_TUNNEL_MAX_SESSION_SECONDS') ?: '3600'));
 
+// Keep sequential protocol exchanges responsive, then restore the original idle cadence.
+const DBX_WORKER_ACTIVE_POLL_US = 10000;
+const DBX_WORKER_WARM_POLL_US = 50000;
+const DBX_WORKER_IDLE_POLL_US = 200000;
+const DBX_WORKER_ACTIVE_POLL_COUNT = 100;
+const DBX_WORKER_WARM_POLL_COUNT = 20;
+
+// Standalone tests load the worker helpers without dispatching an HTTP request.
+if (defined('DBX_TUNNEL_FUNCTIONS_ONLY') && DBX_TUNNEL_FUNCTIONS_ONLY) {
+    return;
+}
+
 if (PHP_SAPI === 'cli' && isset($argv[1]) && $argv[1] === '--dbx-worker') {
     run_worker($argv[2] ?? '', $argv[3] ?? '', (int) ($argv[4] ?? 0), (int) ($argv[5] ?? 10));
     exit;
@@ -53,6 +65,11 @@ try {
 
 function handle_open(): void
 {
+    $workerStartMethod = worker_start_method();
+    if ($workerStartMethod === null) {
+        respond_error(503, 'HTTP tunnel is unsupported on this PHP host: it requires PHP-FPM fastcgi_finish_request() or permission to spawn PHP CLI with popen()');
+    }
+
     $session = request_session();
     $host = request_param('dbx_target_host');
     $port = (int) request_param('dbx_target_port');
@@ -71,7 +88,7 @@ function handle_open(): void
     touch($dir . DIRECTORY_SEPARATOR . 'in.queue');
     touch($dir . DIRECTORY_SEPARATOR . 'out.queue');
 
-    if (function_exists('fastcgi_finish_request')) {
+    if ($workerStartMethod === 'fastcgi') {
         respond_json(['ok' => true], false);
         fastcgi_finish_request();
         run_worker($dir, $host, $port, $connectTimeout);
@@ -85,7 +102,23 @@ function handle_open(): void
         respond_error(500, 'PHP tunnel worker did not start');
     }
 
-    respond_error(500, 'PHP tunnel requires PHP-FPM fastcgi_finish_request or permission to spawn PHP CLI');
+    respond_error(503, 'HTTP tunnel worker could not be started with popen()');
+}
+
+function worker_start_method(): ?string
+{
+    return select_worker_start_method(function_exists('fastcgi_finish_request'), function_exists('popen'));
+}
+
+function select_worker_start_method(bool $hasFastcgiFinishRequest, bool $hasPopen): ?string
+{
+    if ($hasFastcgiFinishRequest) {
+        return 'fastcgi';
+    }
+    if ($hasPopen) {
+        return 'popen';
+    }
+    return null;
 }
 
 function handle_write(): void
@@ -160,6 +193,7 @@ function run_worker(string $dir, string $host, int $port, int $connectTimeout): 
     stream_set_blocking($socket, false);
     $expiresAt = time() + $DBX_TUNNEL_MAX_SESSION_SECONDS;
     $lastActivity = time();
+    $idlePolls = 0;
 
     try {
         while (time() < $expiresAt) {
@@ -167,16 +201,18 @@ function run_worker(string $dir, string $host, int $port, int $connectTimeout): 
                 break;
             }
 
+            $activity = false;
             $inbound = drain_chunks($dir, 'in');
             if ($inbound !== '') {
                 write_all($socket, $inbound);
                 $lastActivity = time();
+                $activity = true;
             }
 
             $read = [$socket];
             $write = [];
             $except = [];
-            $ready = @stream_select($read, $write, $except, 0, 200000);
+            $ready = @stream_select($read, $write, $except, 0, worker_poll_timeout_us($idlePolls));
             if ($ready === false) {
                 write_error($dir, 'Failed to poll target database socket');
                 break;
@@ -194,8 +230,11 @@ function run_worker(string $dir, string $host, int $port, int $connectTimeout): 
                 } else {
                     append_chunk($dir, 'out', $data);
                     $lastActivity = time();
+                    $activity = true;
                 }
             }
+
+            $idlePolls = next_worker_idle_poll_count($idlePolls, $activity);
 
             if (time() - $lastActivity > $DBX_TUNNEL_MAX_SESSION_SECONDS) {
                 break;
@@ -207,6 +246,25 @@ function run_worker(string $dir, string $host, int $port, int $connectTimeout): 
 
     fclose($socket);
     mark_closed($dir);
+}
+
+function worker_poll_timeout_us(int $idlePolls): int
+{
+    if ($idlePolls < DBX_WORKER_ACTIVE_POLL_COUNT) {
+        return DBX_WORKER_ACTIVE_POLL_US;
+    }
+    if ($idlePolls < DBX_WORKER_ACTIVE_POLL_COUNT + DBX_WORKER_WARM_POLL_COUNT) {
+        return DBX_WORKER_WARM_POLL_US;
+    }
+    return DBX_WORKER_IDLE_POLL_US;
+}
+
+function next_worker_idle_poll_count(int $idlePolls, bool $activity): int
+{
+    if ($activity) {
+        return 0;
+    }
+    return min($idlePolls + 1, DBX_WORKER_ACTIVE_POLL_COUNT + DBX_WORKER_WARM_POLL_COUNT);
 }
 
 function write_all($socket, string $data): void

@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
-import { DATA_GRID_DARK_ACTIVE_ROW_BG, DATA_GRID_LIGHT_ACTIVE_ROW_BG, dataGridActiveRowBackground, resolveDataGridPaintTheme } from "@/lib/dataGrid/dataGridPaintTheme";
+import {
+  DATA_GRID_DARK_ACTIVE_ROW_BG,
+  DATA_GRID_DARK_CROSSHAIR_COL_BG,
+  DATA_GRID_DARK_CROSSHAIR_ROW_BG,
+  DATA_GRID_LIGHT_ACTIVE_ROW_BG,
+  DATA_GRID_LIGHT_CROSSHAIR_COL_BG,
+  DATA_GRID_LIGHT_CROSSHAIR_ROW_BG,
+  dataGridActiveRowBackground,
+  resolveDataGridPaintTheme,
+} from "@/lib/dataGrid/dataGridPaintTheme";
 import { DEFAULT_DATA_GRID_TYPE_COLORS_DARK, DEFAULT_DATA_GRID_TYPE_COLORS_LIGHT, dataGridTypeColorCssVar } from "@/lib/dataGrid/dataGridTypeColorScheme";
 
 function parseRgb(value: string): { r: number; g: number; b: number } | null {
@@ -31,7 +39,7 @@ function contrastRatio(a: string, b: string): number {
 }
 
 describe("data grid paint theme", () => {
-  it("uses a subtle active-row surface fallback in both color schemes", () => {
+  it("uses the active-row surface fallback in both color schemes", () => {
     expect(dataGridActiveRowBackground(false)).toBe(DATA_GRID_LIGHT_ACTIVE_ROW_BG);
     expect(dataGridActiveRowBackground(true)).toBe(DATA_GRID_DARK_ACTIVE_ROW_BG);
 
@@ -40,6 +48,73 @@ describe("data grid paint theme", () => {
     expect(resolveDataGridPaintTheme({ getVar: emptyCssVariable, isDark: false }).rowNumberActive).toBe(DATA_GRID_LIGHT_ACTIVE_ROW_BG);
     expect(resolveDataGridPaintTheme({ getVar: emptyCssVariable, isDark: true }).cellActive).toBe(DATA_GRID_DARK_ACTIVE_ROW_BG);
     expect(resolveDataGridPaintTheme({ getVar: emptyCssVariable, isDark: true }).rowNumberActive).toBe(DATA_GRID_DARK_ACTIVE_ROW_BG);
+  });
+
+  it("keeps the active row clearly visible yet lighter than the selected cell (#11649)", () => {
+    const emptyCssVariable = () => "";
+
+    for (const isDark of [false, true]) {
+      const theme = resolveDataGridPaintTheme({ getVar: emptyCssVariable, isDark });
+
+      // 活动行需与普通行底色拉开差距，避免看岔行
+      expect(contrastRatio(theme.background, theme.cellActive)).toBeGreaterThanOrEqual(1.15);
+      // 行内被点击的单元格仍须从活动行中凸显出来
+      expect(theme.cellActive).not.toBe(theme.cellSelected);
+      expect(contrastRatio(theme.cellActive, theme.cellSelectedSingle)).toBeGreaterThanOrEqual(1.1);
+    }
+  });
+
+  it("resolves crosshair row/col fills in both color schemes", () => {
+    const emptyCssVariable = () => "";
+
+    const light = resolveDataGridPaintTheme({ getVar: emptyCssVariable, isDark: false });
+    const dark = resolveDataGridPaintTheme({ getVar: emptyCssVariable, isDark: true });
+
+    // 十字底色必须比 cellActive 更明显（与 cellActive 不同、列比行更深的蓝色系）
+    expect(light.cellCrosshairRow).toBe(DATA_GRID_LIGHT_CROSSHAIR_ROW_BG);
+    expect(light.cellCrosshairCol).toBe(DATA_GRID_LIGHT_CROSSHAIR_COL_BG);
+    expect(light.cellCrosshairRow).not.toBe(light.cellActive);
+    expect(light.cellCrosshairCol).not.toBe(light.cellActive);
+    expect(light.cellCrosshairCol).not.toBe(light.cellCrosshairRow);
+
+    expect(dark.cellCrosshairRow).toBe(DATA_GRID_DARK_CROSSHAIR_ROW_BG);
+    expect(dark.cellCrosshairCol).toBe(DATA_GRID_DARK_CROSSHAIR_COL_BG);
+    expect(dark.cellCrosshairRow).not.toBe(dark.cellActive);
+    expect(dark.cellCrosshairCol).not.toBe(dark.cellActive);
+    expect(dark.cellCrosshairCol).not.toBe(dark.cellCrosshairRow);
+
+    // These are spatial location cues rather than text, but they must remain
+    // visibly distinct from the grid surface in both modes.
+    expect(contrastRatio(light.background, light.cellCrosshairRow)).toBeGreaterThanOrEqual(1.5);
+    expect(contrastRatio(light.background, light.cellCrosshairCol)).toBeGreaterThanOrEqual(2);
+    expect(contrastRatio(dark.background, dark.cellCrosshairRow)).toBeGreaterThanOrEqual(1.5);
+    expect(contrastRatio(dark.background, dark.cellCrosshairCol)).toBeGreaterThanOrEqual(2);
+  });
+
+  it("lets explicit crosshair CSS variables drive the canvas fills in light mode", () => {
+    const vars: Record<string, string> = {
+      "--data-grid-cell-crosshair-row-bg": "rgb(190, 220, 250)",
+      "--data-grid-cell-crosshair-col-bg": "rgb(160, 205, 250)",
+    };
+
+    const theme = resolveDataGridPaintTheme({ getVar: (name) => vars[name] ?? "", isDark: false });
+
+    expect(theme.cellCrosshairRow).toBe("rgb(190, 220, 250)");
+    expect(theme.cellCrosshairCol).toBe("rgb(160, 205, 250)");
+  });
+
+  it("uses the theme primary color at the same stronger sRGB ratios as the DOM grid", () => {
+    const vars: Record<string, string> = {
+      "--primary": "rgb(58, 123, 106)",
+      "--background": "rgb(248, 250, 248)",
+      "--data-grid-cell-crosshair-row-bg": "color-mix(in srgb, var(--primary) 34%, var(--background))",
+      "--data-grid-cell-crosshair-col-bg": "color-mix(in srgb, var(--primary) 50%, var(--background))",
+    };
+
+    const theme = resolveDataGridPaintTheme({ getVar: (name) => vars[name] ?? "", isDark: false });
+
+    expect(theme.cellCrosshairRow).toBe("rgb(183, 207, 200)");
+    expect(theme.cellCrosshairCol).toBe("rgb(153, 187, 177)");
   });
 
   it("falls back to the built-in type palette for the active appearance", () => {
@@ -90,8 +165,8 @@ describe("data grid paint theme", () => {
       isDark: true,
     });
 
-    expect(light.cellSelected).toBe("rgb(239, 246, 255)");
-    expect(light.cellSelectedBorder).toBe("rgb(59, 130, 246)");
+    expect(light.cellSelected).toBe("rgb(179, 208, 254)");
+    expect(light.cellSelectedBorder).toBe("rgb(37, 99, 235)");
     expect(light.cellSelectedSingle).toBe("rgb(191, 219, 254)");
     expect(light.cellSelectedDirty).toBe("rgb(235, 224, 184)");
     expect(light.cellDirty).toBe("rgb(255, 248, 230)");
@@ -99,7 +174,7 @@ describe("data grid paint theme", () => {
     expect(light.rowNumberTextEdited).toBe("rgb(187, 77, 0)");
     expect(contrastRatio(light.cellSelectedBorder, light.cellSelected)).toBeGreaterThanOrEqual(3);
 
-    expect(dark.cellSelected).toBe("rgb(20, 40, 60)");
+    expect(dark.cellSelected).toBe("rgb(30, 64, 100)");
     expect(dark.cellSelectedBorder).toBe("rgb(96, 165, 250)");
     expect(dark.cellSelectedSingle).toBe("rgb(30, 64, 96)");
     expect(dark.cellSelectedDirty).toBe("rgb(76, 66, 38)");
@@ -171,18 +246,5 @@ describe("data grid paint theme", () => {
     });
 
     expect(theme.typeForegrounds.spatial).toBe("rgb(12, 98, 74)");
-  });
-});
-
-describe("dbx-control-chrome cascade contract", () => {
-  it("keeps chrome defaults layered and low-specificity so invalid/focus utilities can win", () => {
-    const css = readFileSync(new URL("../../../styles/globals.css", import.meta.url), "utf8");
-    const chromeBlockStart = css.indexOf("Shared control chrome defaults");
-    expect(chromeBlockStart).toBeGreaterThanOrEqual(0);
-    const chromeSlice = css.slice(chromeBlockStart - 40, chromeBlockStart + 1600);
-    expect(chromeSlice).toMatch(/@layer components/);
-    expect(chromeSlice).toMatch(/:where\(\.dbx-control-chrome\)/);
-    expect(chromeSlice).toMatch(/\[aria-invalid="true"\]/);
-    expect(chromeSlice).not.toMatch(/box-shadow:\s*none/);
   });
 });

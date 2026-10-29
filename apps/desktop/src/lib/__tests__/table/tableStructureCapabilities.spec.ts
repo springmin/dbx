@@ -93,10 +93,46 @@ describe("tableStructureCapabilities", () => {
     expect(getTableStructureCapabilities("dameng", "dameng").comment).toBe(true);
   });
 
-  it("enables alter primary key for Dameng without enabling it for Oracle", () => {
-    expect(getTableStructureCapabilities("dameng", "dameng").alterPrimaryKey).toBe(true);
-    expect(getTableStructureCapabilities("oracle", "oracle").alterPrimaryKey).toBe(false);
-    expect(getTableStructureCapabilities("oceanbase-oracle", "oceanbase-oracle").alterPrimaryKey).toBe(false);
+  it("separates adding a primary key from replacing an existing one", () => {
+    expect(getTableStructureCapabilities("dameng", "dameng")).toMatchObject({
+      addPrimaryKey: true,
+      alterPrimaryKey: true,
+    });
+    expect(getTableStructureCapabilities("oracle", "oracle")).toMatchObject({
+      addPrimaryKey: true,
+      alterPrimaryKey: false,
+    });
+    expect(getTableStructureCapabilities("sqlserver", "sqlserver")).toMatchObject({
+      addPrimaryKey: true,
+      alterPrimaryKey: true,
+      foreignKey: true,
+    });
+    expect(getTableStructureCapabilities("oceanbase-oracle", "oceanbase-oracle")).toMatchObject({
+      addPrimaryKey: true,
+      alterPrimaryKey: false,
+      foreignKey: false,
+    });
+    for (const databaseType of ["yashandb", "xugu", "iris"] as const) {
+      expect(getTableStructureCapabilities(databaseType, databaseType)).toMatchObject({
+        addPrimaryKey: false,
+        alterPrimaryKey: false,
+      });
+    }
+  });
+
+  it("enables only the verified Inceptor column structure operations", () => {
+    expect(getTableStructureCapabilities("transwarp", "transwarp")).toMatchObject({
+      dialect: "mysql",
+      alterStrategy: "direct",
+      createTable: true,
+      addColumn: true,
+      dropColumn: false,
+      renameColumn: true,
+      alterExistingColumn: true,
+      comment: true,
+      createIndex: false,
+      foreignKey: false,
+    });
   });
 
   it("uses local-only column reordering for editable databases without physical reorder support", () => {

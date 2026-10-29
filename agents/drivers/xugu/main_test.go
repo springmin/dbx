@@ -361,9 +361,19 @@ func TestListDataTypesReturnsXuguTypes(t *testing.T) {
 	if err := json.Unmarshal(data, &result); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"INTEGER", "VARCHAR", "NUMERIC", "INT"} {
+	for _, want := range []string{
+		"INTEGER", "VARCHAR", "NUMERIC", "INT",
+		"TINYINT", "DOUBLE", "DATETIME", "DATETIME WITH TIME ZONE", "TIME WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE",
+		"INTERVAL YEAR", "INTERVAL DAY TO SECOND", "GUID", "ROWID", "JSON", "BIT", "VARBIT",
+		"INTEGER[]", "DOUBLE[]", "CHAR[]", "CLOB[]",
+	} {
 		if !contains(result, want) {
 			t.Fatalf("expected data type %q in %v", want, result)
+		}
+	}
+	for _, pseudoType := range []string{"NULL", `"NULL"`, "ARRAY", "ROWVERSION", "POINT", "LSEG", "LINE", "BOX", "PATH", "POLYGON", "CIRCLE"} {
+		if contains(result, pseudoType) {
+			t.Fatalf("pseudo/internal type %q must not be offered as a regular column type: %v", pseudoType, result)
 		}
 	}
 }
@@ -439,6 +449,34 @@ func TestBuildDSNUsesConnectionFields(t *testing.T) {
 		if !strings.Contains(dsn, part) {
 			t.Fatalf("dsn should contain %s, got: %s", part, dsn)
 		}
+	}
+}
+
+func TestOpenDBRejectsMissingDatabaseBeforeOpeningDriver(t *testing.T) {
+	tests := []struct {
+		name   string
+		params connectParams
+	}{
+		{name: "empty structured database", params: connectParams{Host: "db.example.com", Username: "app"}},
+		{name: "whitespace structured database", params: connectParams{Host: "db.example.com", Database: " \t ", Username: "app"}},
+		{name: "empty native DSN database", params: connectParams{ConnectionString: "IP=db.example.com;DB=;User=app"}},
+		{name: "quoted whitespace native DSN database", params: connectParams{ConnectionString: "IP=db.example.com;DB='  ';User=app"}},
+		{name: "URL without database", params: connectParams{ConnectionString: "xugu://app:secret@db.example.com:5138/"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := openDB(test.params)
+			if err == nil {
+				if db != nil {
+					_ = db.Close()
+				}
+				t.Fatal("expected missing database to be rejected before opening the driver")
+			}
+			if !strings.Contains(err.Error(), "XuguDB requires an existing database name") {
+				t.Fatalf("unexpected missing-database error: %v", err)
+			}
+		})
 	}
 }
 
@@ -697,6 +735,9 @@ func TestConfiguredDatabaseName(t *testing.T) {
 		{params: connectParams{ConnectionString: "xugu://user:secret@db.example.com:5138/demo"}, want: "demo"},
 		{params: connectParams{ConnectionString: "jdbc:xugu://db.example.com:5138/reporting"}, want: "reporting"},
 		{params: connectParams{ConnectionString: "IP=db.example.com;DB=SYSTEM;User=SYSDBA;PWD=secret"}, want: "SYSTEM"},
+		{params: connectParams{ConnectionString: "IP=db.example.com;DB='shop;east';User=APP"}, want: "shop;east"},
+		{params: connectParams{ConnectionString: "IP=db.example.com;DB='sales''east';User=APP"}, want: "sales'east"},
+		{params: connectParams{ConnectionString: "IP=db.example.com;DB='  ';User=APP"}, want: ""},
 	}
 
 	for _, tc := range cases {
@@ -734,10 +775,10 @@ func TestXuguListSchemasExposesPublicScopeWithoutGUESTCollision(t *testing.T) {
 		public       bool
 		want         []string
 	}{
-		{name: "private only", want: []string{"APP_TEST", "SYSDBA"}},
-		{name: "public without real guest", public: true, want: []string{"APP_TEST", "SYSDBA", xuguPublicSynonymScope}},
-		{name: "public with real guest", realGuest: true, public: true, want: []string{"APP_TEST", "GUEST", "SYSDBA", xuguPublicSynonymScope}},
-		{name: "public with former reserved schema", realReserved: true, public: true, want: []string{"APP_TEST", "__DBX_XUGU_PUBLIC_SYNONYMS__", "SYSDBA", xuguPublicSynonymScope}},
+		{name: "private only", want: []string{"APP_TEST", "SYSDBA", xuguSchedulerJobScope}},
+		{name: "public synonyms", public: true, want: []string{"APP_TEST", "SYSDBA", xuguPublicSynonymScope, xuguSchedulerJobScope}},
+		{name: "public with real guest", realGuest: true, public: true, want: []string{"APP_TEST", "GUEST", "SYSDBA", xuguPublicSynonymScope, xuguSchedulerJobScope}},
+		{name: "public with former reserved schema", realReserved: true, public: true, want: []string{"APP_TEST", "__DBX_XUGU_PUBLIC_SYNONYMS__", "SYSDBA", xuguPublicSynonymScope, xuguSchedulerJobScope}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -789,7 +830,7 @@ func TestXuguListSchemasFallsBackWhenCombinedQueryIsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listSchemas() error: %v", err)
 	}
-	if want := []string{"APP_TEST", "GUEST", "SYSDBA"}; !reflect.DeepEqual(got, want) {
+	if want := []string{"APP_TEST", "GUEST", "SYSDBA", xuguSchedulerJobScope}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("listSchemas() = %v, want %v", got, want)
 	}
 	xuguSchemaListingState.Lock()
@@ -939,6 +980,59 @@ func TestGetColumnsFallsBackWhenOnNullMetadataIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestXuguPrimaryKeyMatchesColumnCaseWhenCatalogsDisagree(t *testing.T) {
+	primaryKeys := map[string]bool{"ID": true}
+	if !xuguPrimaryKeyMatches("id", primaryKeys) {
+		t.Fatal("expected an unquoted primary key to match the column despite case differences")
+	}
+	if !xuguPrimaryKeyMatches("ID", primaryKeys) {
+		t.Fatal("expected an exact primary-key match")
+	}
+}
+
+func TestXuguPrimaryKeyMatchingDoesNotGuessAmbiguousCase(t *testing.T) {
+	primaryKeys := map[string]bool{"ID": true, "id": true}
+	if xuguPrimaryKeyMatches("Id", primaryKeys) {
+		t.Fatal("must not choose between primary-key names that differ only by case")
+	}
+}
+
+func TestGetColumnsMarksXuguIdentityColumnsAsAutoIncrement(t *testing.T) {
+	db, err := sql.Open("xugu-test-table-ddl", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	columns, err := s.getColumns("APP", "CHILD")
+	if err != nil {
+		t.Fatalf("get columns: %v", err)
+	}
+	if len(columns) != 2 {
+		t.Fatalf("expected two columns, got %#v", columns)
+	}
+	if columns[0].Name != "ID" || columns[0].Extra == nil || *columns[0].Extra != "auto_increment" {
+		t.Fatalf("identity column should be marked auto_increment: %#v", columns[0])
+	}
+	if columns[1].Name != "PARENT_ID" || columns[1].Extra != nil {
+		t.Fatalf("ordinary column must not be marked auto_increment: %#v", columns[1])
+	}
+}
+
+func TestXuguIdentityColumnMatchingIsCaseInsensitiveOnlyWhenUnambiguous(t *testing.T) {
+	if !xuguIdentityMatchesColumn("id", map[string]xuguIdentityInfo{"ID": {Column: "ID"}}) {
+		t.Fatal("expected an unambiguous case-insensitive identity match")
+	}
+	if xuguIdentityMatchesColumn("id", map[string]xuguIdentityInfo{
+		"ID": {Column: "ID"},
+		"Id": {Column: "Id"},
+	}) {
+		t.Fatal("ambiguous case-insensitive identity names must not match")
+	}
+}
+
 func TestIndexSQLUsesLowPrivilegeDictionary(t *testing.T) {
 	sqlText := strings.ToUpper(xuguListIndexesSQL)
 
@@ -950,6 +1044,173 @@ func TestIndexSQLUsesLowPrivilegeDictionary(t *testing.T) {
 	for _, forbidden := range []string{"SYS_INDEXES", "SYS_TABLES", "SYS_SCHEMAS"} {
 		if strings.Contains(sqlText, forbidden) {
 			t.Fatalf("index listing should not query %s, got: %s", forbidden, xuguListIndexesSQL)
+		}
+	}
+}
+
+func TestIndexPartitionMetadataUsesLowPrivilegeDictionary(t *testing.T) {
+	for name, query := range map[string]string{
+		"index attributes":    xuguIndexPartitionAttributesSQL,
+		"index partitions":    xuguIndexPartitionsSQL,
+		"index subpartitions": xuguIndexSubpartitionsSQL,
+	} {
+		t.Run(name, func(t *testing.T) {
+			upper := strings.ToUpper(query)
+			for _, want := range []string{"ALL_INDEXES", "ALL_TABLES", "ALL_SCHEMAS", "CURRENT_DB_ID"} {
+				if !strings.Contains(upper, want) {
+					t.Fatalf("%s query should contain %s: %s", name, want, query)
+				}
+			}
+			if name != "index attributes" && !strings.Contains(upper, "ALL_IDX_") {
+				t.Fatalf("%s query should use the low-privilege index partition view: %s", name, query)
+			}
+			for _, forbidden := range []string{"SYS_INDEXES", "SYS_IDX_PARTIS", "SYS_IDX_SUBPARTIS"} {
+				if strings.Contains(upper, forbidden) {
+					t.Fatalf("%s query should not use %s: %s", name, forbidden, query)
+				}
+			}
+		})
+	}
+	if !strings.Contains(strings.ToUpper(xuguIndexPartitionAttributesSQL), "IS_LOCAL") {
+		t.Fatal("index attributes query must preserve LOCAL scope")
+	}
+	for _, query := range []string{xuguIndexPartitionAttributesSQL, xuguIndexPartitionsSQL, xuguIndexSubpartitionsSQL} {
+		upper := strings.ToUpper(query)
+		if !strings.Contains(upper, "SCHEMA_NAME = ?") || !strings.Contains(upper, "TABLE_NAME = ?") {
+			t.Fatalf("index metadata query must be scoped to the resolved schema/table: %s", query)
+		}
+	}
+}
+
+func TestXuguIndexScopeDDL(t *testing.T) {
+	indexType := "BTREE"
+	cases := []struct {
+		name  string
+		index indexInfo
+		want  string
+	}{
+		{
+			name:  "ordinary index does not invent GLOBAL",
+			index: indexInfo{IndexType: &indexType},
+			want:  " INDEXTYPE IS BTREE",
+		},
+		{
+			name:  "spatial index preserves Xugu RTREE type",
+			index: indexInfo{IndexType: indexTypePtr("RTREE")},
+			want:  " INDEXTYPE IS RTREE",
+		},
+		{
+			name:  "local partition index",
+			index: indexInfo{IndexType: &indexType, IsLocal: true},
+			want:  " INDEXTYPE IS BTREE LOCAL",
+		},
+		{
+			name: "global range partition index",
+			index: indexInfo{
+				IndexType: indexTypePtr("BTREE"), PartitionType: 1, PartitionKey: `"CREATED_AT"`,
+				PartitionRowsLoaded: true,
+				IndexPartitions: []xuguPartitionInfo{
+					{Name: "P1", Value: "'2025-01-01'"},
+					{Name: "P2", Value: "'2026-01-01'"},
+				},
+			},
+			want: " GLOBAL PARTITION BY RANGE (\"CREATED_AT\") PARTITIONS (",
+		},
+		{
+			name: "global hash partition index",
+			index: indexInfo{
+				IndexType: indexTypePtr("BTREE"), PartitionType: 3, PartitionCount: 4,
+				PartitionKey: `"CUSTOMER_ID"`, PartitionRowsLoaded: true,
+			},
+			want: " GLOBAL PARTITION BY HASH (\"CUSTOMER_ID\") PARTITIONS 4",
+		},
+		{
+			name:  "incomplete global metadata is not emitted",
+			index: indexInfo{IndexType: indexTypePtr("BTREE"), PartitionType: 1, PartitionKey: `"ID"`},
+			want:  " INDEXTYPE IS BTREE",
+		},
+		{
+			name:  "global hash without a count is not emitted",
+			index: indexInfo{IndexType: indexTypePtr("BTREE"), PartitionType: 3, PartitionKey: `"ID"`, PartitionRowsLoaded: true},
+			want:  " INDEXTYPE IS BTREE",
+		},
+		{
+			name: "malformed global partition row is not emitted",
+			index: indexInfo{
+				IndexType: indexTypePtr("BTREE"), PartitionType: 2, PartitionKey: `"REGION"`,
+				PartitionRowsLoaded: true, IndexPartitions: []xuguPartitionInfo{{Name: "P1"}},
+			},
+			want: " INDEXTYPE IS BTREE",
+		},
+		{
+			name: "incomplete subpartition keeps valid first level",
+			index: indexInfo{
+				IndexType: indexTypePtr("BTREE"), PartitionType: 2, PartitionKey: `"REGION"`,
+				PartitionRowsLoaded: true, IndexPartitions: []xuguPartitionInfo{{Name: "P1", Value: "'CN'"}},
+				SubpartitionType: 3, SubpartitionKey: `"ID"`,
+			},
+			want: " GLOBAL PARTITION BY LIST (\"REGION\") PARTITIONS (",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var builder strings.Builder
+			appendXuguIndexOptions(&builder, tc.index)
+			got := builder.String()
+			if got != tc.want && !strings.Contains(got, tc.want) {
+				t.Fatalf("index option DDL = %q, want %q", got, tc.want)
+			}
+			if tc.name == "ordinary index does not invent GLOBAL" && strings.Contains(got, "GLOBAL") {
+				t.Fatalf("ordinary index must not be labeled GLOBAL: %q", got)
+			}
+			if tc.name == "incomplete subpartition keeps valid first level" && strings.Contains(got, "SUBPARTITION") {
+				t.Fatalf("incomplete subpartition metadata must not produce a partial clause: %q", got)
+			}
+		})
+	}
+}
+
+func TestXuguIndexTypeName(t *testing.T) {
+	for _, tc := range []struct {
+		value any
+		want  string
+	}{
+		{value: int64(0), want: "BTREE"},
+		{value: int64(1), want: "RTREE"},
+		{value: int64(2), want: "FULLTEXT"},
+		{value: int64(3), want: "BITMAP"},
+		{value: "RTREE", want: "RTREE"},
+		{value: "vendor-specific", want: "vendor-specific"},
+	} {
+		t.Run(fmt.Sprint(tc.value), func(t *testing.T) {
+			if got := indexTypeName(tc.value); got != tc.want {
+				t.Fatalf("indexTypeName(%v) = %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func indexTypePtr(value string) *string { return &value }
+
+func TestXuguIndexPartitionDetailsStayInternalToTheGenericPayload(t *testing.T) {
+	data, err := json.Marshal(indexInfo{
+		Name: "IDX_LOCAL", Columns: []string{"ID"}, IsLocal: true,
+		PartitionType: 1, PartitionKey: `"ID"`, PartitionRowsLoaded: true,
+		IndexPartitions: []xuguPartitionInfo{{Name: "P1", Value: "MAXVALUES"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, forbidden := range []string{"is_local", "partition_type", "partition_key", "index_partitions"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("Xugu-specific index partition field %q leaked into generic metadata: %s", forbidden, text)
+		}
+	}
+	for _, required := range []string{`"name":"IDX_LOCAL"`, `"columns":["ID"]`} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("generic index metadata lost %q: %s", required, text)
 		}
 	}
 }
@@ -1305,6 +1566,100 @@ func TestGetSequenceSourceReconstructsExecutableDDL(t *testing.T) {
 	}
 }
 
+func TestRenderXuguSchedulerJobDDLReconstructsEscapedReplayableCall(t *testing.T) {
+	ddl := renderXuguSchedulerJobDDL(xuguSchedulerJobMetadata{
+		Name:           `DBX_JOB_'A`,
+		JobType:        "plsql_block",
+		ParameterCount: 2,
+		Action:         `BEGIN do_work('x'); END;`,
+		BeginTime:      "2026-08-29 10:15:00",
+		RepeatInterval: "FREQ=DAILY;INTERVAL=2",
+		EndTime:        nil,
+		Enabled:        true,
+		AutoDrop:       false,
+		Comments:       `owner's scheduled task`,
+	})
+
+	for _, want := range []string{
+		"EXEC DBMS_SCHEDULER.CREATE_JOB(",
+		"'DBX_JOB_''A'",
+		"'plsql_block'",
+		"'BEGIN do_work(''x''); END;'",
+		"2",
+		"'2026-08-29 10:15:00'",
+		"'FREQ=DAILY;INTERVAL=2'",
+		"NULL",
+		"'default_class'",
+		"true",
+		"false",
+		"'owner''s scheduled task'",
+		");",
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Fatalf("scheduler DDL is missing %q:\n%s", want, ddl)
+		}
+	}
+}
+
+func TestXuguSchedulerJobQueriesRemainInCurrentDatabase(t *testing.T) {
+	listQuery := xuguSchedulerJobsQuery(metadataListConstraints{ObjectTypes: []string{"JOB"}})
+	if !strings.Contains(listQuery.SQL, "DB_ID = CURRENT_DB_ID") || !strings.Contains(listQuery.SQL, "'JOB'") {
+		t.Fatalf("job list must remain current-database scoped: %s", listQuery.SQL)
+	}
+
+	metadataQuery := xuguSchedulerJobMetadataQuery("DbxJob")
+	if !strings.Contains(metadataQuery, "DB_ID = CURRENT_DB_ID") || !strings.Contains(metadataQuery, "JOB_NAME = 'DbxJob'") {
+		t.Fatalf("job metadata must remain exact-name and current-database scoped: %s", metadataQuery)
+	}
+	if !strings.Contains(metadataQuery, "TO_CHAR(BEGIN_T)") || !strings.Contains(metadataQuery, "TO_CHAR(END_T)") {
+		t.Fatalf("scheduler timestamps must be read as text to preserve SQL NULL values: %s", metadataQuery)
+	}
+
+	exact := xuguCatalogSchedulerJobNameQuery("DbxJob", false)
+	folded := xuguCatalogSchedulerJobNameQuery("DbxJob", true)
+	if strings.Contains(exact, "UPPER(JOB_NAME)") || !strings.Contains(folded, "UPPER(JOB_NAME)") {
+		t.Fatalf("job source lookup must prefer exact case before folded fallback: exact=%s folded=%s", exact, folded)
+	}
+}
+
+func TestXuguNullableSchedulerLiteralTreatsEmptyCatalogValueAsNull(t *testing.T) {
+	if got := xuguNullableSchedulerLiteral(""); got != "NULL" {
+		t.Fatalf("empty optional scheduler metadata should render as NULL, got %q", got)
+	}
+	if got := xuguNullableSchedulerLiteral(" "); got != "NULL" {
+		t.Fatalf("whitespace-only optional scheduler metadata should render as NULL, got %q", got)
+	}
+	if got := xuguNullableSchedulerLiteral("FREQ=DAILY"); got != "'FREQ=DAILY'" {
+		t.Fatalf("non-empty scheduler metadata should remain quoted, got %q", got)
+	}
+}
+
+func TestXuguNullableSchedulerEndTimeTreatsCatalogSentinelsAsNull(t *testing.T) {
+	for _, value := range []any{
+		"1816-03-30T05:56:08.065277376Z",
+		"9999-12-31 23:59:59",
+		"9999-12-31T23:59:59Z",
+	} {
+		if got := xuguNullableSchedulerEndTimeLiteral(value); got != "NULL" {
+			t.Fatalf("Xugu no-end sentinel %v should render as NULL, got %q", value, got)
+		}
+	}
+	if got := xuguNullableSchedulerEndTimeLiteral("2029-01-01 01:00:00"); got != "'2029-01-01 01:00:00'" {
+		t.Fatalf("real scheduler end time should remain quoted, got %q", got)
+	}
+}
+
+func TestXuguSchedulerJobCatalogErrorsDegradeWithoutBreakingSchemaDiscovery(t *testing.T) {
+	for _, message := range []string{
+		"[E5021] 表或视图 ALL_JOBS 不存在",
+		"permission denied for ALL_JOBS",
+	} {
+		if !isXuguMetadataUnavailableError(errors.New(message)) {
+			t.Fatalf("scheduler catalog error should be treated as optional metadata: %q", message)
+		}
+	}
+}
+
 func TestGetSynonymSourceReconstructsPrivateQuotedDDL(t *testing.T) {
 	db, err := sql.Open("xugu-test-synonym-source", "")
 	if err != nil {
@@ -1572,6 +1927,65 @@ func TestRenderXuguTableDDLPreservesProgrammableTableMetadata(t *testing.T) {
 	}
 }
 
+func TestRenderXuguTableDDLDefersPrimaryKeyForCopyNumberLobTable(t *testing.T) {
+	ddl := renderXuguTableDDL(
+		"APP", "LOB_TABLE",
+		[]columnInfo{
+			{Name: "ID", DataType: "INTEGER", IsNullable: false},
+			{Name: "BLOB_C", DataType: "BLOB", IsNullable: true},
+			{Name: "CLOB_C", DataType: "CLOB", IsNullable: true},
+			{Name: "JSON_C", DataType: "JSON", IsNullable: true},
+			{Name: "XML_C", DataType: "XML", IsNullable: true},
+		},
+		xuguTableMetadata{CopyNum: 3},
+		nil,
+		[]xuguConstraintInfo{{Name: "PK_LOB_TABLE", Type: "P", Definition: `"ID"`, Enabled: true}},
+		nil, nil,
+	)
+
+	if strings.Contains(strings.Split(ddl, "ALTER TABLE")[0], `CONSTRAINT "PK_LOB_TABLE" PRIMARY KEY`) {
+		t.Fatalf("primary key must not be inline for a LOB table with explicit COPY NUMBER:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, "COPY NUMBER 3;\n\nALTER TABLE \"APP\".\"LOB_TABLE\" ADD CONSTRAINT \"PK_LOB_TABLE\" PRIMARY KEY (\"ID\")") {
+		t.Fatalf("the original named primary key must follow CREATE TABLE:\n%s", ddl)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(ddl), ";") {
+		t.Fatalf("standalone table DDL must end with a statement terminator:\n%s", ddl)
+	}
+}
+
+func TestRenderXuguTableDDLLeavesOtherPrimaryKeysInline(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		metadata xuguTableMetadata
+		columns  []columnInfo
+	}{
+		{
+			name:     "copy number without a large-object column",
+			metadata: xuguTableMetadata{CopyNum: 3},
+			columns:  []columnInfo{{Name: "ID", DataType: "INTEGER"}},
+		},
+		{
+			name:     "large-object column without explicit copy number",
+			metadata: xuguTableMetadata{},
+			columns:  []columnInfo{{Name: "ID", DataType: "INTEGER"}, {Name: "BODY", DataType: "CLOB"}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ddl := renderXuguTableDDL(
+				"APP", "T", test.columns, test.metadata, nil,
+				[]xuguConstraintInfo{{Name: "PK_T", Type: "P", Definition: `"ID"`, Enabled: true}}, nil, nil,
+			)
+			if !strings.Contains(ddl, `CONSTRAINT "PK_T" PRIMARY KEY ("ID")`) {
+				t.Fatalf("primary key must remain inline outside the verified Xugu case:\n%s", ddl)
+			}
+			if strings.Contains(ddl, `ALTER TABLE "APP"."T" ADD CONSTRAINT "PK_T" PRIMARY KEY`) {
+				t.Fatalf("primary key must not be deferred outside the verified Xugu case:\n%s", ddl)
+			}
+		})
+	}
+}
+
 func TestRenderXuguTableDDLSkipsImplicitIdentityUniqueConstraint(t *testing.T) {
 	ddl := renderXuguTableDDL(
 		"AppSchema", "tbIdentityAndDefaults",
@@ -1801,6 +2215,44 @@ func TestDecodeXuguScale(t *testing.T) {
 	precision, scale, length = decodeXuguScale("VARCHAR", &charScale)
 	if precision != nil || scale != nil || length == nil || *length != 128 {
 		t.Fatalf("unexpected char scale decode: precision=%v scale=%v length=%v", precision, scale, length)
+	}
+
+	for _, test := range []struct {
+		dataType string
+		value    int
+	}{
+		{dataType: "BIT", value: 8},
+		{dataType: "VARBIT", value: 64},
+		{dataType: "TIME", value: 3},
+		{dataType: "TIME WITH TIME ZONE", value: 3},
+		{dataType: "TIMESTAMP", value: 6},
+		{dataType: "TIMESTAMP WITH TIME ZONE", value: 6},
+	} {
+		precision, scale, length = decodeXuguScale(test.dataType, &test.value)
+		if precision == nil || *precision != test.value || scale != nil || length != nil {
+			t.Fatalf("unexpected %s scale decode: precision=%v scale=%v length=%v", test.dataType, precision, scale, length)
+		}
+	}
+
+}
+
+func TestColumnTypeDDLPreservesXuguSingleParameters(t *testing.T) {
+	for _, test := range []struct {
+		dataType  string
+		precision int
+		want      string
+	}{
+		{dataType: "BIT", precision: 8, want: "BIT(8)"},
+		{dataType: "VARBIT", precision: 64, want: "VARBIT(64)"},
+		{dataType: "TIME", precision: 3, want: "TIME(3)"},
+		{dataType: "TIME WITH TIME ZONE", precision: 3, want: "TIME(3) WITH TIME ZONE"},
+		{dataType: "TIMESTAMP", precision: 6, want: "TIMESTAMP(6)"},
+		{dataType: "TIMESTAMP WITH TIME ZONE", precision: 6, want: "TIMESTAMP(6) WITH TIME ZONE"},
+	} {
+		column := columnInfo{DataType: test.dataType, NumericPrecision: &test.precision}
+		if got := columnTypeDDL(column); got != test.want {
+			t.Fatalf("columnTypeDDL(%s, %d) = %q, want %q", test.dataType, test.precision, got, test.want)
+		}
 	}
 }
 
@@ -2400,6 +2852,7 @@ func init() {
 	sql.Register("xugu-test-eof", &xuguEOFDriver{})
 	sql.Register("xugu-test-trigger-details", &xuguTriggerDetailsDriver{})
 	sql.Register("xugu-test-schema-listing", &xuguSchemaListingDriver{})
+	sql.Register("xugu-test-index-partition-fallback", &xuguIndexPartitionFallbackDriver{})
 }
 
 var xuguSchemaListingState struct {
@@ -2556,6 +3009,24 @@ func TestMetadataPermissionFallbackDoesNotReturnRPCError(t *testing.T) {
 	}
 }
 
+func TestIndexListingSurvivesUnavailablePartitionCatalog(t *testing.T) {
+	db, err := sql.Open("xugu-test-index-partition-fallback", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := newServer()
+	s.db = db
+	indexes, err := s.listIndexes("APP", "T")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(indexes) != 1 || indexes[0].Name != "IDX_T" || indexes[0].IsLocal {
+		t.Fatalf("stable index listing should survive unavailable partition metadata: %#v", indexes)
+	}
+}
+
 func TestGetColumnsFallsBackToDirectObjectAccessOnMetadataPermission(t *testing.T) {
 	db, err := sql.Open("xugu-test-permission-metadata", "")
 	if err != nil {
@@ -2673,6 +3144,40 @@ func TestObjectSourcePermissionFallbackIsExplicitAndReadOnly(t *testing.T) {
 type xuguShowResultDriver struct{}
 
 type xuguPermissionMetadataDriver struct{}
+
+type xuguIndexPartitionFallbackDriver struct{}
+
+func (d *xuguIndexPartitionFallbackDriver) Open(string) (driver.Conn, error) {
+	return &xuguIndexPartitionFallbackConn{}, nil
+}
+
+type xuguIndexPartitionFallbackConn struct{}
+
+func (c *xuguIndexPartitionFallbackConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguIndexPartitionFallbackConn) Close() error { return nil }
+func (c *xuguIndexPartitionFallbackConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("not supported")
+}
+func (c *xuguIndexPartitionFallbackConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	upper := strings.ToUpper(query)
+	switch {
+	case strings.Contains(upper, "SELECT S.SCHEMA_NAME, T.TABLE_NAME"):
+		return &xuguStaticRows{columns: []string{"SCHEMA_NAME", "TABLE_NAME"}, values: [][]driver.Value{{"APP", "T"}}}, nil
+	case strings.Contains(upper, "I.IS_LOCAL"):
+		return nil, errors.New("unknown column IS_LOCAL in older Xugu catalog")
+	case strings.Contains(upper, "FROM ALL_IDX_PARTIS"), strings.Contains(upper, "FROM ALL_IDX_SUBPARTIS"):
+		return nil, errors.New("index partition views are unavailable in older Xugu catalog")
+	case strings.Contains(upper, "SELECT I.INDEX_NAME, I.KEYS"):
+		return &xuguStaticRows{
+			columns: []string{"INDEX_NAME", "KEYS", "IS_UNIQUE", "IS_PRIMARY", "INDEX_TYPE", "FILTER"},
+			values:  [][]driver.Value{{"IDX_T", `"ID"`, false, false, int64(0), nil}},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unexpected index fallback query: %s", query)
+	}
+}
 
 type xuguFallbackErrorDriver struct{}
 
@@ -3575,4 +4080,36 @@ func waitForXuguActiveOperation(t *testing.T, s *server) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("operation did not become active")
+}
+
+func TestNormalizeValueWithTypeFormatsXuguWritableTemporals(t *testing.T) {
+	// XuguDB rejects the ISO "T"/"Z" literal that RFC3339Nano produces
+	// (E19138 时间值常数错误), so temporal values must round-trip as a
+	// space-separated wall-clock string. See issue #8110.
+	loc := time.FixedZone("CST", 8*3600)
+	instant := time.Date(2026, 6, 1, 19, 42, 21, 17_000_000, loc)
+
+	cases := []struct {
+		name       string
+		columnType string
+		expected   string
+	}{
+		{name: "datetime", columnType: "DATETIME", expected: "2026-06-01 19:42:21.017"},
+		{name: "timestamp", columnType: "TIMESTAMP", expected: "2026-06-01 19:42:21.017"},
+		{name: "date", columnType: "DATE", expected: "2026-06-01 19:42:21.017"},
+		{name: "unknown type falls back to timezone-less", columnType: "", expected: "2026-06-01 19:42:21.017"},
+		{name: "datetime with time zone keeps offset", columnType: "DATETIME WITH TIME ZONE", expected: "2026-06-01 19:42:21.017 +08:00"},
+		{name: "timestamp with time zone keeps offset", columnType: "TIMESTAMP(6) WITH TIME ZONE", expected: "2026-06-01 19:42:21.017 +08:00"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeValueWithType(instant, tc.columnType)
+			if got != tc.expected {
+				t.Fatalf("normalizeValueWithType(%q) = %q, want %q", tc.columnType, got, tc.expected)
+			}
+			if str, ok := got.(string); ok && strings.ContainsAny(str, "TZ") {
+				t.Fatalf("formatted temporal %q still contains an ISO T/Z literal Xugu rejects", str)
+			}
+		})
+	}
 }

@@ -50,13 +50,17 @@ impl DuckDbWorkerSession {
     pub fn execute(&mut self, params: DuckDbWorkerExecuteParams) -> Result<db::QueryResult, String> {
         let connection = self.connection.as_ref().ok_or("DuckDB worker is not connected")?.clone();
         let locked = connection.lock().map_err(|e| e.to_string())?;
-        let result = crate::query::duckdb_execute_for_database(
-            &locked,
-            &self.attached_names,
-            params.database.as_deref(),
-            &params.sql,
-            params.max_rows,
-        )?;
+        let result = if params.preserve_insertion_order {
+            execute_with_preserved_insertion_order(&locked, &self.attached_names, &params)?
+        } else {
+            crate::query::duckdb_execute_for_database(
+                &locked,
+                &self.attached_names,
+                params.database.as_deref(),
+                &params.sql,
+                params.max_rows,
+            )?
+        };
         if let Some(name) = crate::sql::attached_name_from_attach_sql(&params.sql) {
             if !self.attached_names.iter().any(|attached| attached.eq_ignore_ascii_case(&name)) {
                 self.attached_names.push(name);
@@ -148,6 +152,27 @@ impl DuckDbWorkerSession {
         Ok(connection.interrupt_handle())
     }
 
+    /// Takes and closes the connection so DuckDB's shutdown checkpoint runs and
+    /// the database WAL is removed before this worker exits. Returns false —
+    /// leaving the connection untouched — when the connection is poisoned
+    /// (dropping it aborts the process) so the caller falls back to an
+    /// immediate exit and the WAL replays on the next open.
+    fn close_connection_for_shutdown(&mut self) -> bool {
+        if self.connection.is_none() {
+            return true;
+        }
+        if !self.is_connection_healthy() {
+            return false;
+        }
+        match self.connection.take() {
+            Some(connection) => {
+                crate::connection::close_connection(connection);
+                true
+            }
+            None => true,
+        }
+    }
+
     /// Probes whether the connection is still usable after an execute error.
     ///
     /// duckdb-rs 1.10503.1 has a bug where `Connection::prepare()` failing at the
@@ -166,6 +191,53 @@ impl DuckDbWorkerSession {
                 Err(_) => false,
             },
             None => false,
+        }
+    }
+}
+
+fn execute_with_preserved_insertion_order(
+    connection: &duckdb::Connection,
+    attached_names: &[String],
+    params: &DuckDbWorkerExecuteParams,
+) -> Result<db::QueryResult, String> {
+    let current: String = connection
+        .query_row("SELECT CAST(current_setting('preserve_insertion_order') AS VARCHAR)", [], |row| row.get(0))
+        .map_err(|error| format!("Failed to read DuckDB preserve_insertion_order setting: {error}"))?;
+    let was_enabled = current
+        .parse::<bool>()
+        .map_err(|error| format!("Invalid DuckDB preserve_insertion_order setting {current:?}: {error}"))?;
+    if was_enabled {
+        return crate::query::duckdb_execute_for_database(
+            connection,
+            attached_names,
+            params.database.as_deref(),
+            &params.sql,
+            params.max_rows,
+        );
+    }
+
+    // LIMIT/OFFSET Parquet pages are separate scans. Temporarily enabling this
+    // setting makes every page use the same source order without changing the
+    // user's connection-level setting after the request completes.
+    connection
+        .execute_batch("SET preserve_insertion_order = true")
+        .map_err(|error| format!("Failed to enable DuckDB insertion-order preservation: {error}"))?;
+    let result = crate::query::duckdb_execute_for_database(
+        connection,
+        attached_names,
+        params.database.as_deref(),
+        &params.sql,
+        params.max_rows,
+    );
+    let restore = connection.execute_batch("SET preserve_insertion_order = false");
+
+    match (result, restore) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(error)) => {
+            Err(format!("DuckDB query succeeded but restoring preserve_insertion_order failed: {error}"))
+        }
+        (Err(query_error), Err(restore_error)) => {
+            Err(format!("{query_error}; restoring preserve_insertion_order also failed: {restore_error}"))
         }
     }
 }
@@ -205,6 +277,21 @@ struct WorkerHandleResult {
 }
 
 impl DuckDbWorkerRuntime {
+    /// Closes the session connection when the worker is idle and the connection
+    /// is healthy, so the DuckDB shutdown checkpoint removes the WAL. Returns
+    /// false when a query is running (the session is locked or an interrupt is
+    /// registered) or the connection is poisoned; callers then keep the legacy
+    /// immediate-exit behavior and rely on WAL replay at the next open.
+    fn close_session_for_shutdown(&self) -> bool {
+        if self.active_interrupt.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            return false;
+        }
+        match self.session.try_lock() {
+            Ok(mut session) => session.close_connection_for_shutdown(),
+            Err(_) => false,
+        }
+    }
+
     async fn handle_request(
         &self,
         request: DuckDbWorkerRequest,
@@ -327,10 +414,18 @@ impl DuckDbWorkerRuntime {
                     shutdown: false,
                 }
             }
-            DuckDbWorkerMethod::Shutdown => WorkerHandleResult {
-                response: Some(DuckDbWorkerResponse::ok(request.id, serde_json::json!({ "shutdown": true }))),
-                shutdown: true,
-            },
+            DuckDbWorkerMethod::Shutdown => {
+                // Close the connection before acking: the checkpoint that removes
+                // the WAL must finish before the parent observes this response
+                // (or the process exit it waits for). Busy or poisoned sessions
+                // skip the close; the parent's kill fallback and WAL replay on
+                // the next open cover them.
+                self.close_session_for_shutdown();
+                WorkerHandleResult {
+                    response: Some(DuckDbWorkerResponse::ok(request.id, serde_json::json!({ "shutdown": true }))),
+                    shutdown: true,
+                }
+            }
         }
     }
 
@@ -377,7 +472,15 @@ pub async fn run_stdio_worker() -> Result<(), String> {
     loop {
         let line = lines.next_line().await.map_err(|e| e.to_string())?;
         let Some(line) = line else {
-            std::process::exit(0);
+            // Parent closed stdin (exit or crash). Idle workers checkpoint and
+            // remove their WAL on the normal return path; a worker still running
+            // a query must not wait for it (nor drop a poisoned connection),
+            // so it keeps the legacy immediate exit and the WAL replays on the
+            // next open.
+            if !runtime.close_session_for_shutdown() {
+                std::process::exit(0);
+            }
+            break;
         };
         if line.trim().is_empty() {
             continue;
@@ -445,11 +548,67 @@ mod tests {
             .expect("connect");
 
         let result = session
-            .execute(DuckDbWorkerExecuteParams { sql: "SELECT 1 AS value".to_string(), database: None, max_rows: None })
+            .execute(DuckDbWorkerExecuteParams {
+                sql: "SELECT 1 AS value".to_string(),
+                database: None,
+                max_rows: None,
+                preserve_insertion_order: false,
+            })
             .expect("execute");
 
         assert_eq!(result.columns, vec!["value"]);
         assert_eq!(result.rows, vec![vec![serde_json::json!(1)]]);
+    }
+
+    #[test]
+    fn worker_session_scopes_insertion_order_preservation() {
+        let mut session = DuckDbWorkerSession::default();
+        session
+            .connect(DuckDbWorkerConnectParams {
+                path: ":memory:".to_string(),
+                attached_databases: Vec::new(),
+                init_script: Some("SET preserve_insertion_order = false".to_string()),
+            })
+            .expect("connect");
+
+        let disabled = session
+            .execute(DuckDbWorkerExecuteParams {
+                sql: "SELECT current_setting('preserve_insertion_order') AS setting".to_string(),
+                database: None,
+                max_rows: None,
+                preserve_insertion_order: false,
+            })
+            .expect("read initial setting");
+        assert_eq!(disabled.rows, vec![vec![serde_json::json!(false)]]);
+
+        let preserved = session
+            .execute(DuckDbWorkerExecuteParams {
+                sql: "SELECT current_setting('preserve_insertion_order') AS setting".to_string(),
+                database: None,
+                max_rows: None,
+                preserve_insertion_order: true,
+            })
+            .expect("execute with order preservation");
+        assert_eq!(preserved.rows, vec![vec![serde_json::json!(true)]]);
+
+        session
+            .execute(DuckDbWorkerExecuteParams {
+                sql: "SELECT * FROM missing_table".to_string(),
+                database: None,
+                max_rows: None,
+                preserve_insertion_order: true,
+            })
+            .expect_err("missing table should fail");
+
+        let restored = session
+            .execute(DuckDbWorkerExecuteParams {
+                sql: "SELECT current_setting('preserve_insertion_order') AS setting".to_string(),
+                database: None,
+                max_rows: None,
+                preserve_insertion_order: false,
+            })
+            .expect("read restored setting");
+        assert_eq!(restored.rows, vec![vec![serde_json::json!(false)]]);
     }
 
     #[test]
@@ -470,6 +629,7 @@ mod tests {
                     .to_string(),
                 database: None,
                 max_rows: None,
+                preserve_insertion_order: false,
             })
             .expect("create table");
 
@@ -514,6 +674,7 @@ mod tests {
                 sql: "CREATE VIEW active_orders AS SELECT 1 AS id".to_string(),
                 database: None,
                 max_rows: None,
+                preserve_insertion_order: false,
             })
             .expect("create view");
 
@@ -595,6 +756,15 @@ mod tests {
             .expect("list tables");
         assert!(tables.iter().any(|table| table.name == "facts"));
 
+        let columns = session
+            .list_columns(DuckDbWorkerColumnParams {
+                database: "main".to_string(),
+                schema: "warehouse".to_string(),
+                table: "facts".to_string(),
+            })
+            .expect("list init-script attached columns");
+        assert_eq!(columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>(), ["id"]);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -661,6 +831,7 @@ mod tests {
                 sql: format!("ATTACH '{}' AS \"sales db\";", attached_path.to_string_lossy().replace('\'', "''")),
                 database: None,
                 max_rows: None,
+                preserve_insertion_order: false,
             })
             .expect("attach sql");
 
@@ -669,6 +840,15 @@ mod tests {
             .list_tables(DuckDbWorkerTableParams { database: "sales db".to_string(), schema: "main".to_string() })
             .expect("list tables");
         assert!(tables.iter().any(|table| table.name == "orders"));
+
+        let columns = session
+            .list_columns(DuckDbWorkerColumnParams {
+                database: "main".to_string(),
+                schema: "SALES DB".to_string(),
+                table: "orders".to_string(),
+            })
+            .expect("list SQL-attached columns");
+        assert_eq!(columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>(), ["id"]);
 
         let _ = std::fs::remove_dir_all(dir);
     }
