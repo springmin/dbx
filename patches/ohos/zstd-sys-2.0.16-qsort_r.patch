@@ -1,0 +1,16 @@
+--- a/zstd/lib/dictBuilder/cover.c
++++ b/zstd/lib/dictBuilder/cover.c
+@@ -35,6 +35,13 @@
+ #include <string.h> /* memset */
+ #include <time.h>   /* clock */
+ 
++/* OpenHarmony libc exports qsort_r (GNU signature) but does not declare it. */
++#if !defined(__GLIBC__) && !defined(__ANDROID__) && defined(_GNU_SOURCE)
++extern void qsort_r(void *__base, size_t __nmemb, size_t __size,
++                    int (*__compar)(const void *, const void *, void *),
++                    void *__arg);
++#endif
++
+ #ifndef ZDICT_STATIC_LINKING_ONLY
+ #  define ZDICT_STATIC_LINKING_ONLY
+ #endif

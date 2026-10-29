@@ -1,0 +1,47 @@
+--- a/aws-lc/CMakeLists.txt
++++ b/aws-lc/CMakeLists.txt
+@@ -1124,6 +1124,15 @@
+   # Some consumers might use upper-case (e.g.) "X86" or "X86_64".
+   # Matching below is based on lower-case.
+   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CMAKE_SYSTEM_PROCESSOR_LOWER)
++  # OpenHarmony (harmonybrew) cmake may fail to detect the host processor
++  # ("unknown"), which would disable all perlasm assembly below.
++  if(CMAKE_SYSTEM_PROCESSOR_LOWER STREQUAL "" OR CMAKE_SYSTEM_PROCESSOR_LOWER STREQUAL "unknown")
++    execute_process(COMMAND uname -m OUTPUT_VARIABLE CMAKE_SYSTEM_PROCESSOR_LOWER OUTPUT_STRIP_TRAILING_WHITESPACE)
++    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR_LOWER}" CMAKE_SYSTEM_PROCESSOR_LOWER)
++    if(CMAKE_SYSTEM_PROCESSOR_LOWER MATCHES "aarch64|arm64")
++      set(CMAKE_SIZEOF_VOID_P 8)
++    endif()
++  endif()
+ endif()
+ 
+ if(OPENSSL_NO_ASM)
+--- a/aws-lc/crypto/fipsmodule/CMakeLists.txt
++++ b/aws-lc/crypto/fipsmodule/CMakeLists.txt
+@@ -190,7 +190,7 @@
+ 
+ # s2n-bignum files can be compiled on Unix platforms for x86_64 and arm64 only.
+ if((((ARCH STREQUAL "x86_64") AND NOT MY_ASSEMBLER_IS_TOO_OLD_FOR_512AVX) OR
+-      ARCH STREQUAL "aarch64") AND UNIX)
++      ARCH STREQUAL "aarch64") AND (UNIX OR DEFINED OHOS_ARCH))
+ 
+   # Set the source directory for s2n-bignum assembly files
+   if(ARCH STREQUAL "x86_64")
+@@ -404,7 +404,7 @@
+ endif()
+ 
+ # mlkem-native assembly files can be compiled on Unix platforms for x86_64 and arm64 only.
+-if((ARCH STREQUAL "aarch64") AND UNIX)
++if((ARCH STREQUAL "aarch64") AND (UNIX OR DEFINED OHOS_ARCH))
+ 
+   # Set the source directory for s2n-bignum assembly files
+   set(MLKEM_NATIVE_DIR "${AWSLC_SOURCE_DIR}/crypto/fipsmodule/ml_kem")
+@@ -464,7 +464,7 @@
+ 
+ # mldsa-native assembly files can be compiled on Unix platforms for x86_64
+ # and aarch64.
+-if(UNIX AND ((ARCH STREQUAL "x86_64" AND NOT MY_ASSEMBLER_IS_TOO_OLD_FOR_AVX) OR (ARCH STREQUAL "aarch64")))
++if((UNIX OR DEFINED OHOS_ARCH) AND ((ARCH STREQUAL "x86_64" AND NOT MY_ASSEMBLER_IS_TOO_OLD_FOR_AVX) OR (ARCH STREQUAL "aarch64")))
+ 
+   set(MLDSA_NATIVE_DIR "${AWSLC_SOURCE_DIR}/crypto/fipsmodule/ml_dsa")
+ 
