@@ -1,0 +1,13 @@
+{
+  "name": "lightningcss-openharmony-arm64",
+  "version": "1.33.0",
+  "private": true,
+  "description": "OpenHarmony JS fallback for the lightningcss platform binding",
+  "main": "index.js",
+  "os": [
+    "openharmony"
+  ],
+  "cpu": [
+    "arm64"
+  ]
+}
