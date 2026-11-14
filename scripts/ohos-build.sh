@@ -20,7 +20,11 @@ CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
 DBX_DEPLOY_DIR=${DBX_DEPLOY_DIR:-$HOME/dbx-ohos}
 
 if [ -z "${OHOS_SDK_NATIVE:-}" ]; then
-  OHOS_SDK_NATIVE=$(ls -d "$HOME"/.harmonybrew/Cellar/ohos-sdk/*/native 2>/dev/null | tail -1 || true)
+  # SDK 26.0.0.38+ uses Cellar/ohos-sdk-native/<ver>; older layouts used
+  # Cellar/ohos-sdk/<ver>/native. Prefer whichever has an llvm/ directory.
+  for candidate in "$HOME"/.harmonybrew/Cellar/ohos-sdk-native/* "$HOME"/.harmonybrew/Cellar/ohos-sdk/*/native; do
+    [ -d "$candidate/llvm" ] && OHOS_SDK_NATIVE="$candidate"
+  done
 fi
 OHOS_SIGN_TOOL=${OHOS_SIGN_TOOL:-$HOME/.harmonybrew/bin/binary-sign-tool}
 OHOS_LLVM_LIB=${OHOS_SDK_NATIVE:+$OHOS_SDK_NATIVE/llvm/lib}
@@ -56,7 +60,7 @@ cmd_patches() {
       "OHOS_ARCH" "aws-lc/crypto/fipsmodule/CMakeLists.txt"
   apply_patch_idempotent "$src/zstd-sys-2.0.16+zstd.1.5.7" \
       "$ROOT/patches/ohos/zstd-sys-2.0.16-qsort_r.patch" \
-      "OpenHarmony libc exports qsort_r" "zstd/lib/dictBuilder/cover.c"
+      "OpenHarmony (musl) exports qsort_r" "zstd/lib/dictBuilder/cover.c"
   if [ "$PATCH_APPLIED" = 1 ]; then
     echo "clearing aws-lc build cache (CMake caches the processor detection)"
     rm -rf "$ROOT"/target/release/build/aws-lc-sys-* \

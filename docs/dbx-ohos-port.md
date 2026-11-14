@@ -502,7 +502,8 @@ sh ~/dbx-ohos/start.sh
 
 ```sh
 # 0) 前置:rustc host = aarch64-unknown-linux-ohos,Node/pnpm 可用
-export OHOS_LLVM=/storage/Users/currentUser/.harmonybrew/Cellar/ohos-sdk/26.0.0.18_2/native/llvm
+# SDK 26.0.0.38 起路径是 ohos-sdk-native/<ver>;旧布局是 ohos-sdk/<ver>/native
+export OHOS_LLVM=/storage/Users/currentUser/.harmonybrew/Cellar/ohos-sdk-native/26.0.0.38/llvm
 export LD_LIBRARY_PATH=$OHOS_LLVM/lib:$LD_LIBRARY_PATH
 
 # 1) 依赖补丁:patches/ohos/*.patch(aws-lc-sys、zstd-sys)
@@ -530,9 +531,10 @@ pnpm build
 
 ### 10.4 已知限制(v0.6.61)
 
-1. **方言**:`plugins/dialects/transwarp.yaml` 仍无法加载。除缺 `max_length` 外,`DialectKind` 没有 Hive 家族,`from_label("Transwarp")` 返回 `None`。当前 36/37 方言,Transwarp Inceptor 仅保留连接/JDBC 能力。
+1. **方言**:`plugins/dialects/transwarp.yaml` 仍无法加载。除缺 `max_length` 外,`DialectKind` 没有 Hive 家族,`from_label("Transwarp")` 返回 `None`。当前 36/37 方言,Transwarp Inceptor 仅保留连接/JDBC 能力。上游 PR `t8y2/dbx#14981` 已修复并完成设备验证,合并后可删除本地补丁。
 2. **CSS 优化**:lightningcss 在 OHOS 上以直通实现替代,`optimize` 不生效;最终 CSS 仍由 esbuild 压缩。
 3. **构建不可 CI 化**:标准 rustc 没有 `aarch64-unknown-linux-ohos` target,必须在设备(或 OHOS 版 rustc)上原生构建。
 4. **`node_modules` 补丁易失**:重新 `pnpm install` 后需重做 10.3(已脚本化)。
 5. **依赖补丁在 registry 源码内**:见 `patches/ohos/`,由 `scripts/ohos-build.sh patches` 幂等应用。
 6. **远程数据库未回归**:本次仅冒烟 SQLite;MySQL / PostgreSQL / MongoDB 等需真实服务验证。
+7. **上游进展(2026-11-14)**:`t8y2/dbx#14981`(transwarp,已设备验证)、`aws/aws-lc-rs#1293`(draft,已设备验证)、`meta/zstd#4886`、`tailwindlabs/tailwindcss#20629`。合并发版后,本仓库对应的 transwarp / aws-lc / zstd / lightningcss 补丁可逐步删除。
