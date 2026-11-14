@@ -538,3 +538,4 @@ pnpm build
 5. **依赖补丁在 registry 源码内**:见 `patches/ohos/`,由 `scripts/ohos-build.sh patches` 幂等应用。
 6. **远程数据库未回归**:本次仅冒烟 SQLite;MySQL / PostgreSQL / MongoDB 等需真实服务验证。
 7. **上游进展(2026-11-14)**:`t8y2/dbx#14981`(transwarp,已设备验证)、`aws/aws-lc-rs#1293`(draft,已设备验证)、`meta/zstd#4886`、`tailwindlabs/tailwindcss#20629`。合并发版后,本仓库对应的 transwarp / aws-lc / zstd / lightningcss 补丁可逐步删除。
+8. **DuckDB**:`duckdb` 需要 Driver Manager 安装的 driver agent(`agent`),发布包未内置。OHOS 上从 Driver Manager 下载的二进制未签名、无法执行;需自行构建 `agents/drivers/duckdb` 并设置 `DBX_DUCKDB_DRIVER_PATH`(该 agent 依赖 bundled DuckDB 1.3.2,目前没有 OHOS 构建)。连接时会返回 `DuckDB driver is not installed...`。
