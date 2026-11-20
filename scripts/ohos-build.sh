@@ -15,6 +15,8 @@
 #   OHOS_SIGN_TOOL   binary-sign-tool path
 #   DBX_DEPLOY_DIR   deployment directory (default: $HOME/dbx-ohos)
 #   CARGO_HOME       cargo home (default: $HOME/.cargo)
+#   PNPM             pnpm executable (default: pnpm)
+#   DBX_RELEASE_VERSION  override the version in the release package name
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -29,6 +31,7 @@ if [ -z "${OHOS_SDK_NATIVE:-}" ]; then
   done
 fi
 OHOS_SIGN_TOOL=${OHOS_SIGN_TOOL:-$HOME/.harmonybrew/bin/binary-sign-tool}
+PNPM=${PNPM:-pnpm}
 OHOS_LLVM_LIB=${OHOS_SDK_NATIVE:+$OHOS_SDK_NATIVE/llvm/lib}
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -91,8 +94,8 @@ sign_node_bindings() {
 fix_oxide_link() {
   oxide=$(ls -d "$ROOT"/node_modules/.pnpm/@tailwindcss+oxide@*/node_modules/@tailwindcss/oxide 2>/dev/null | head -1)
   [ -n "$oxide" ] || { echo "oxide package not installed, skipping"; return; }
-  version=$(basename "$(dirname "$oxide")")
-  version=${version##*@}
+  version=$(sed -n 's/^  "version": "\([^"]*\)",$/\1/p' "$oxide/package.json" | head -1)
+  [ -n "$version" ] || { echo "cannot determine oxide version, skipping"; return; }
   target="../../../@tailwindcss+oxide-linux-arm64-musl@$version/node_modules/@tailwindcss/oxide-linux-arm64-musl"
   link="$(dirname "$oxide")/oxide-openharmony-arm64"
   if [ -e "$ROOT/node_modules/.pnpm/@tailwindcss+oxide-linux-arm64-musl@$version" ]; then
@@ -106,12 +109,12 @@ fix_oxide_link() {
 cmd_frontend() {
   if [ ! -d "$ROOT/node_modules" ]; then
     echo "installing pnpm dependencies"
-    CI=true pnpm install --frozen-lockfile
+    CI=true "$PNPM" install --frozen-lockfile
   fi
   sign_node_bindings
   fix_oxide_link
   echo "building frontend"
-  LD_LIBRARY_PATH="${OHOS_LLVM_LIB:-}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" pnpm build
+  LD_LIBRARY_PATH="${OHOS_LLVM_LIB:-}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$PNPM" build
 }
 
 cmd_backend() {
@@ -144,7 +147,7 @@ cmd_deploy() {
 cmd_release() {
   [ -f "$ROOT/target/release/dbx-web" ] || die "dbx-web not built (run: $0 backend)"
   [ -d "$ROOT/dist" ] || die "dist/ not built (run: $0 frontend)"
-  version=$(sed -n 's/^  "version": "\([^"]*\)",$/\1/p' "$ROOT/package.json" | head -1)
+  version=${DBX_RELEASE_VERSION:-$(sed -n 's/^  "version": "\([^"]*\)",$/\1/p' "$ROOT/package.json" | head -1)}
   [ -n "$version" ] || die "cannot read version from package.json"
   pkg="dbx-web-$version-ohos-aarch64"
   out=${DBX_RELEASE_DIR:-$DBX_DEPLOY_DIR/releases}
