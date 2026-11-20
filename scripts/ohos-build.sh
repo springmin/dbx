@@ -17,6 +17,7 @@
 #   CARGO_HOME       cargo home (default: $HOME/.cargo)
 #   PNPM             pnpm executable (default: pnpm)
 #   DBX_RELEASE_VERSION  override the version in the release package name
+#   DBX_CARGO_OFFLINE    set to 1 to pass --offline to cargo
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -119,10 +120,12 @@ cmd_frontend() {
 
 cmd_backend() {
   [ -n "$OHOS_LLVM_LIB" ] || die "OHOS SDK not found; set OHOS_SDK_NATIVE"
+  offline=
+  [ "${DBX_CARGO_OFFLINE:-0}" = 1 ] && offline=--offline
   # The SDK lld needs the SDK's own libxml2; an incompatible copy in
   # ~/.harmonybrew/lib would otherwise shadow it and break every link.
   LD_LIBRARY_PATH="$OHOS_LLVM_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-    cargo build --offline --release -p dbx-web \
+    cargo build $offline --release -p dbx-web \
       --config 'profile.release.lto=false' \
       --config 'profile.release.codegen-units=16'
 }
@@ -186,7 +189,6 @@ Known limitations (v$version):
   - DuckDB needs the driver agent; no OHOS agent is bundled. Install it from
     the Driver Manager or set DBX_DUCKDB_DRIVER_PATH (the binary must be
     signed for OpenHarmony).
-  - The Transwarp/Inceptor dialect is not registered in this build (36/37).
   - CSS optimization is disabled (Vite/esbuild still minifies the bundle).
 EOF
   tar -czf "$out/$pkg.tar.gz" -C "$stage" "$pkg"

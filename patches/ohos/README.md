@@ -15,5 +15,3 @@ corresponding upstream fixes are released.
   lightningcss native binding; drop after
   [tailwindcss#20629](https://github.com/tailwindlabs/tailwindcss/pull/20629)
   is released.
-- The `transwarp` dialect fix is a source commit on this branch; drop it after
-  [dbx#14981](https://github.com/t8y2/dbx/pull/14981) is merged.

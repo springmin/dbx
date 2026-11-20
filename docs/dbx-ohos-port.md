@@ -531,11 +531,21 @@ pnpm build
 
 ### 10.4 已知限制(v0.6.61)
 
-1. **方言**:`plugins/dialects/transwarp.yaml` 仍无法加载。除缺 `max_length` 外,`DialectKind` 没有 Hive 家族,`from_label("Transwarp")` 返回 `None`。当前 36/37 方言,Transwarp Inceptor 仅保留连接/JDBC 能力。上游 PR `t8y2/dbx#14981` 已修复并完成设备验证,合并后可删除本地补丁。
+1. **方言**:v0.6.72 起上游已注册 Transwarp(`DialectKind::Transwarp`),37/37 方言正常;本地 `max_length` 补丁已随合并移除。
 2. **CSS 优化**:lightningcss 在 OHOS 上以直通实现替代,`optimize` 不生效;最终 CSS 仍由 esbuild 压缩。
 3. **构建不可 CI 化**:标准 rustc 没有 `aarch64-unknown-linux-ohos` target,必须在设备(或 OHOS 版 rustc)上原生构建。
 4. **`node_modules` 补丁易失**:重新 `pnpm install` 后需重做 10.3(已脚本化)。
 5. **依赖补丁在 registry 源码内**:见 `patches/ohos/`,由 `scripts/ohos-build.sh patches` 幂等应用。
 6. **远程数据库未回归**:本次仅冒烟 SQLite;MySQL / PostgreSQL / MongoDB 等需真实服务验证。
-7. **上游进展(2026-11-14)**:`t8y2/dbx#14981`(transwarp,已设备验证)、`aws/aws-lc-rs#1293`(draft,已设备验证)、`meta/zstd#4886`、`tailwindlabs/tailwindcss#20629`。合并发版后,本仓库对应的 transwarp / aws-lc / zstd / lightningcss 补丁可逐步删除。
+7. **上游进展(2026-11-20)**:`t8y2/dbx#14981` 已合入 v0.6.72;`aws/aws-lc-rs#1293` 仍为 draft(已设备验证);`meta/zstd#4886` 仍受作者 CLA 阻塞;`tailwindlabs/tailwindcss#20629` 仍 OPEN;`t8y2/dbx#14996`(OpenSSL 可选化)暂无回复。
 8. **DuckDB**:`duckdb` 需要 Driver Manager 安装的 driver agent(`agent`),发布包未内置。OHOS 上从 Driver Manager 下载的二进制未签名、无法执行;需自行构建 `agents/drivers/duckdb` 并设置 `DBX_DUCKDB_DRIVER_PATH`(该 agent 依赖 bundled DuckDB 1.3.2,目前没有 OHOS 构建)。连接时会返回 `DuckDB driver is not installed...`。
+
+## 11. v0.6.72 更新(2026-11-20)
+
+- 合并上游 v0.6.72(638 个提交);Transwarp Inceptor 由上游注册,方言 **37/37**。
+- 依赖版本未变:`aws-lc-sys 0.43.0`、`zstd-sys 2.0.16`,`patches/ohos/` 继续适用。
+- 前端依赖升级:`rolldown 1.2.16`、`@tailwindcss/oxide 4.3.4`;lightningcss shim 保留。
+- 构建 SDK:`ohos-sdk-native/26.0.0.38`;二进制 115,230,464 字节。
+- 发布包:`dbx-web-0.6.72-ohos-aarch64.tar.gz`(59,945,225 字节),
+  SHA256 `b9950af39cb0f2e705b7e6647af9900c69699f914d034f2eb40488a5bef66a38`。
+- 服务验证:`Registered 37 core dialects`、`Dialect plugins loaded: 37 success, 0 errors`、SQLite 查询正常。
