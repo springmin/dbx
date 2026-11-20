@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
@@ -29,6 +30,7 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.SQLClientInfoException;
 import java.sql.SQLFeatureNotSupportedException;
+import java.sql.SQLSyntaxErrorException;
 import java.sql.Statement;
 import java.sql.Time;
 import java.sql.Timestamp;
@@ -39,6 +41,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -51,6 +54,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class DbxJdbcPluginTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    @Test
+    void readsRealH2DriverParametersWithoutConnecting() throws Exception {
+        try (java.net.ServerSocket listener = new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+            listener.setSoTimeout(200);
+            JsonNode response = request("connectionParameters", """
+                { "connection": {
+                  "connection_string": "jdbc:h2:tcp://127.0.0.1:%d/metadata-only",
+                  "jdbc_driver_class": "org.h2.Driver", "username": "sa", "password": "not-for-metadata"
+                }}
+                """.formatted(listener.getLocalPort()));
+            assertFalse(response.has("error"), response.toString());
+            assertTrue(response.path("result").isArray());
+            // H2 deliberately reports no DriverPropertyInfo entries; keep custom editing available.
+            assertTrue(response.path("result").isEmpty());
+            assertFalse(response.toString().contains("not-for-metadata"));
+            assertThrows(java.net.SocketTimeoutException.class, listener::accept);
+        }
+    }
     private static final String CONNECTION = """
         {
           "connection_string": "jdbc:h2:mem:dbx_ctx;DB_CLOSE_DELAY=-1",
@@ -713,6 +735,149 @@ final class DbxJdbcPluginTest {
         assertEquals(5, third.path("result").path("rows").path(0).path(0).asInt());
         assertEquals(false, third.path("result").path("has_more").asBoolean());
         assertEquals(true, third.path("result").path("session_id").isNull());
+    }
+
+    @Test
+    void executeQueryPageRunsCtasInAutoCommitWithoutPagedTransaction() throws Exception {
+        List<String> calls = new ArrayList<>();
+        Driver driver = testDriver("jdbc:postgresql:dbx-ctas", scriptedPostgresConnection(calls, false, 2, false));
+        DriverManager.registerDriver(driver);
+        String connection = """
+            { "connection_string": "jdbc:postgresql:dbx-ctas" }
+            """;
+        try {
+            JsonNode response = request("executeQueryPage", """
+                {
+                  "connection": %s,
+                  "sql": "create table dbx_t1 as (select 1 as a union all select 2 as b)",
+                  "pageSize": 100,
+                  "maxRows": 1000
+                }
+                """.formatted(connection));
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(2, response.path("result").path("affected_rows").asInt());
+            assertEquals(true, response.path("result").path("session_id").isNull());
+            // DDL runs in auto-commit: no paged transaction, hence no
+            // commit/rollback of it. See #14243.
+            assertEquals(-1, callIndex(calls, call -> call.equals("setAutoCommit:false")), calls.toString());
+            assertFalse(calls.contains("commit"), calls.toString());
+            assertFalse(calls.contains("rollback"), calls.toString());
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void pagedQueryCannotReturnRowsSkipsLeadingCommentsAndKeepsQueriesInTheTransaction() throws Exception {
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod("pagedQueryCannotReturnRows", String.class);
+        method.setAccessible(true);
+
+        for (String sql : new String[] {
+            "create table t as select 1",
+            "  \n-- note\n/* block */ truncate table t",
+            "ALTER TABLE t ADD COLUMN c int",
+        }) {
+            assertTrue((boolean) method.invoke(null, sql), sql);
+        }
+        for (String sql : new String[] {
+            "select 1",
+            "with x as (select 1) select * from x",
+            "explain analyze select 1",
+            "(select 1)",
+            "insert into t(a) values (1) returning a",
+            "call refresh_stats()",
+        }) {
+            assertFalse((boolean) method.invoke(null, sql), sql);
+        }
+    }
+
+    @Test
+    void executeQueryPageCommitsEffectfulCursorWhenSessionDrains() throws Exception {
+        List<String> calls = new ArrayList<>();
+        // updateCount -1 with an open result set is what real drivers report --
+        // Statement.getUpdateCount returns -1 whenever the current result is a
+        // ResultSet, including INSERT ... RETURNING -- so commit-on-drain must
+        // not depend on the driver's effect count (#13644 review).
+        Driver driver = testDriver("jdbc:postgresql:dbx-returning", scriptedPostgresConnection(calls, true, -1, false));
+        DriverManager.registerDriver(driver);
+        String connection = """
+            { "connection_string": "jdbc:postgresql:dbx-returning" }
+            """;
+        try {
+            JsonNode response = request("executeQueryPage", """
+                {
+                  "connection": %s,
+                  "sql": "insert into dbx_t1(a) values (1), (2), (3) returning a",
+                  "pageSize": 100,
+                  "maxRows": 1000
+                }
+                """.formatted(connection));
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(3, response.path("result").path("rows").size());
+            assertEquals(false, response.path("result").path("has_more").asBoolean());
+            assertTrue(calls.contains("commit"), calls.toString());
+            assertFalse(calls.contains("rollback"), calls.toString());
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void executeQueryPageSurfacesCommitFailureAsError() throws Exception {
+        List<String> calls = new ArrayList<>();
+        Driver driver = testDriver("jdbc:postgresql:dbx-commit-fail", scriptedPostgresConnection(calls, false, 1, true));
+        DriverManager.registerDriver(driver);
+        String connection = """
+            { "connection_string": "jdbc:postgresql:dbx-commit-fail" }
+            """;
+        try {
+            JsonNode response = request("executeQueryPage", """
+                {
+                  "connection": %s,
+                  "sql": "insert into deferred_check values (1)",
+                  "pageSize": 100,
+                  "maxRows": 1000
+                }
+                """.formatted(connection));
+
+            assertTrue(response.has("error"), "a failed commit must reach the caller as an error: " + response);
+            assertTrue(response.path("error").path("message").asText().contains("deferred constraint violated"), response.toString());
+            int begin = callIndex(calls, call -> call.equals("setAutoCommit:false"));
+            int commit = callIndex(calls, call -> call.equals("commit"));
+            int restore = callIndex(calls, call -> call.equals("setAutoCommit:true"));
+            assertTrue(begin >= 0 && begin < commit && commit < restore, calls.toString());
+            assertTrue(calls.contains("rollback"), "the broken transaction must be cleared: " + calls);
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void executeQueryPageRollsBackWhenPagingFailsMidStream() throws Exception {
+        List<String> calls = new ArrayList<>();
+        Driver driver = testDriver("jdbc:postgresql:dbx-midstream-fail", failingCursorPostgresConnection(calls));
+        DriverManager.registerDriver(driver);
+        String connection = """
+            { "connection_string": "jdbc:postgresql:dbx-midstream-fail" }
+            """;
+        try {
+            JsonNode response = request("executeQueryPage", """
+                {
+                  "connection": %s,
+                  "sql": "select a from dbx_t1",
+                  "pageSize": 100,
+                  "maxRows": 1000
+                }
+                """.formatted(connection));
+
+            assertTrue(response.has("error"), response.toString());
+            assertTrue(calls.contains("rollback"), calls.toString());
+            assertFalse(calls.contains("commit"), calls.toString());
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
     }
 
     @Test
@@ -5344,6 +5509,158 @@ final class DbxJdbcPluginTest {
         );
     }
 
+    /**
+     * PostgreSQL connection mock for the paged-transaction tests: records
+     * transaction control calls and answers one statement that either returns a
+     * fixed three-row result set or no result set at all, with a scripted
+     * update count and an optional commit failure.
+     */
+    private static Connection scriptedPostgresConnection(List<String> calls, boolean returnsResultSet, int updateCount, boolean commitFails) {
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getAutoCommit" -> {
+                    calls.add("getAutoCommit");
+                    yield true;
+                }
+                case "setAutoCommit" -> {
+                    calls.add("setAutoCommit:" + (boolean) args[0]);
+                    yield null;
+                }
+                case "commit" -> {
+                    calls.add("commit");
+                    if (commitFails) {
+                        throw new SQLException("deferred constraint violated");
+                    }
+                    yield null;
+                }
+                case "createStatement" -> scriptedPostgresStatement(calls, returnsResultSet, updateCount);
+                case "isClosed" -> false;
+                case "rollback" -> {
+                    calls.add("rollback");
+                    yield null;
+                }
+                case "close", "setCatalog", "setSchema" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static Statement scriptedPostgresStatement(List<String> calls, boolean returnsResultSet, int updateCount) {
+        return (Statement) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Statement.class },
+            new java.lang.reflect.InvocationHandler() {
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) {
+                    return switch (method.getName()) {
+                        case "execute" -> {
+                            calls.add("execute:" + args[0]);
+                            yield returnsResultSet;
+                        }
+                        case "getResultSet" -> returnsResultSet ? integerResultSet(new int[] {1, 2, 3}) : null;
+                        case "getUpdateCount" -> updateCount;
+                        case "setMaxRows", "setFetchSize", "setQueryTimeout", "close" -> null;
+                        default -> defaultValue(method.getReturnType());
+                    };
+                }
+            }
+        );
+    }
+
+    /**
+     * PostgreSQL connection mock whose cursor dies mid-stream: the first
+     * {@code next()} succeeds, the second throws, simulating a connection
+     * dropped while a paged session is still open.
+     */
+    private static Connection failingCursorPostgresConnection(List<String> calls) {
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getAutoCommit" -> {
+                    calls.add("getAutoCommit");
+                    yield true;
+                }
+                case "setAutoCommit" -> {
+                    calls.add("setAutoCommit:" + (boolean) args[0]);
+                    yield null;
+                }
+                case "commit" -> {
+                    calls.add("commit");
+                    yield null;
+                }
+                case "createStatement" -> (Statement) Proxy.newProxyInstance(
+                    DbxJdbcPluginTest.class.getClassLoader(),
+                    new Class<?>[] { Statement.class },
+                    new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, Method method, Object[] args) {
+                            return switch (method.getName()) {
+                                case "execute" -> {
+                                    calls.add("execute:" + args[0]);
+                                    yield true;
+                                }
+                                case "getResultSet" -> (ResultSet) Proxy.newProxyInstance(
+                                    DbxJdbcPluginTest.class.getClassLoader(),
+                                    new Class<?>[] { ResultSet.class },
+                                    new java.lang.reflect.InvocationHandler() {
+                                        private int nextCalls = 0;
+
+                                        @Override
+                                        public Object invoke(Object proxy, Method method, Object[] args) throws SQLException {
+                                            return switch (method.getName()) {
+                                                case "next" -> {
+                                                    nextCalls++;
+                                                    if (nextCalls == 1) yield true;
+                                                    throw new SQLException("connection closed mid-stream");
+                                                }
+                                                case "getMetaData" -> columnMeta(Types.INTEGER);
+                                                case "getObject" -> 1;
+                                                default -> defaultValue(method.getReturnType());
+                                            };
+                                        }
+                                    }
+                                );
+                                case "getUpdateCount" -> -1;
+                                case "setMaxRows", "setFetchSize", "setQueryTimeout", "close" -> null;
+                                default -> defaultValue(method.getReturnType());
+                            };
+                        }
+                    }
+                );
+                case "isClosed" -> false;
+                case "rollback" -> {
+                    calls.add("rollback");
+                    yield null;
+                }
+                case "close", "setCatalog", "setSchema" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static ResultSet integerResultSet(int[] values) {
+        return (ResultSet) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { ResultSet.class },
+            new java.lang.reflect.InvocationHandler() {
+                private int index = -1;
+
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) {
+                    return switch (method.getName()) {
+                        case "next" -> ++index < values.length;
+                        case "getMetaData" -> columnMeta(Types.INTEGER);
+                        case "getObject" -> values[index];
+                        default -> defaultValue(method.getReturnType());
+                    };
+                }
+            }
+        );
+    }
+
     private static final class RecordingConnectDriver implements Driver {
         private final String urlPrefix;
         private final List<String> urls = new ArrayList<>();
@@ -7428,5 +7745,217 @@ final class DbxJdbcPluginTest {
         assertEquals("SELECT 1 FROM DUAL", DbxJdbcPlugin.trimStatementSql("SELECT 1 FROM DUAL;", true));
         assertEquals("BEGIN\n  NULL;\nEND IF", DbxJdbcPlugin.trimStatementSql("BEGIN\n  NULL;\nEND IF;", true));
         assertEquals("BEGIN\n  NULL;\nEND", DbxJdbcPlugin.trimStatementSql("BEGIN\n  NULL;\nEND;", false));
+    }
+
+    @Test
+    void validateConnectionReportsWhyAConnectionIsUnusableAndReleasesIt() throws Exception {
+        boolean[] valid = { true };
+        boolean[] closedByServer = { false };
+        int[] closeCalls = { 0 };
+        ValidationDriver driver = new ValidationDriver(Set.of("jdbc:dbx-validate:test"), () -> {
+            boolean[] closed = { false };
+            return (proxy, method, args) -> switch (method.getName()) {
+                case "isClosed" -> closed[0] || closedByServer[0];
+                case "isValid" -> valid[0];
+                case "getAutoCommit" -> true;
+                case "close" -> {
+                    closed[0] = true;
+                    closeCalls[0]++;
+                    yield null;
+                }
+                default -> defaultValue(method.getReturnType());
+            };
+        });
+        DriverManager.registerDriver(driver);
+        String connection = "{\"connection_string\":\"jdbc:dbx-validate:test\"}";
+        try {
+            connectForValidation(connection);
+            for (String method : List.of("validateConnection", "validate_connection")) {
+                JsonNode alive = request(method, "{\"connection\":" + connection + ",\"timeoutSecs\":3}");
+                assertFalse(alive.has("error"), alive.toString());
+                assertTrue(alive.path("result").path("valid").asBoolean());
+            }
+
+            valid[0] = false;
+            JsonNode rejected = validationVerdict(connection);
+            assertFalse(rejected.path("valid").asBoolean(true));
+            assertEquals("JDBC connection is not valid", rejected.path("reason").asText());
+            assertEquals(1, closeCalls[0]);
+            assertEquals("JDBC connection is not open", validationVerdict(connection).path("reason").asText());
+
+            valid[0] = true;
+            connectForValidation(connection);
+            assertEquals(2, driver.opens);
+            closedByServer[0] = true;
+            assertEquals("JDBC connection is closed", validationVerdict(connection).path("reason").asText());
+        } finally {
+            closedByServer[0] = false;
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void validateConnectionProbesWithDialectSqlWhenTheDriverCannotAnswerIsValid() throws Exception {
+        Throwable[] isValidFailure = { new UnsupportedOperationException("isValid unsupported") };
+        SQLException[] probeFailure = { null };
+        List<String> executedSql = new ArrayList<>();
+        int[] closeCalls = { 0 };
+        java.util.Map<String, String> probeSqlByUrl = new java.util.LinkedHashMap<>();
+        probeSqlByUrl.put("jdbc:dm://validate-fallback", "SELECT 1 FROM DUAL");
+        probeSqlByUrl.put("jdbc:db2://validate-fallback", "SELECT 1 FROM SYSIBM.SYSDUMMY1");
+        probeSqlByUrl.put("jdbc:sqlserver://validate-fallback", "SELECT 1");
+        ValidationDriver driver = new ValidationDriver(probeSqlByUrl.keySet(), () -> {
+            boolean[] closed = { false };
+            Statement statement = (Statement) Proxy.newProxyInstance(
+                DbxJdbcPluginTest.class.getClassLoader(),
+                new Class<?>[] { Statement.class },
+                (proxy, method, args) -> switch (method.getName()) {
+                    case "execute" -> {
+                        executedSql.add(String.valueOf(args[0]));
+                        if (probeFailure[0] != null) {
+                            throw probeFailure[0];
+                        }
+                        yield true;
+                    }
+                    default -> defaultValue(method.getReturnType());
+                }
+            );
+            return (proxy, method, args) -> switch (method.getName()) {
+                case "isClosed" -> closed[0];
+                case "isValid" -> throw isValidFailure[0];
+                case "createStatement" -> statement;
+                case "getAutoCommit" -> true;
+                case "close" -> {
+                    closed[0] = true;
+                    closeCalls[0]++;
+                    yield null;
+                }
+                default -> defaultValue(method.getReturnType());
+            };
+        });
+        DriverManager.registerDriver(driver);
+        String connection = "";
+        try {
+            for (java.util.Map.Entry<String, String> dialect : probeSqlByUrl.entrySet()) {
+                connection = "{\"connection_string\":\"" + dialect.getKey() + "\"}";
+                connectForValidation(connection);
+                assertTrue(validationVerdict(connection).path("valid").asBoolean());
+                assertEquals(List.of(dialect.getValue()), executedSql);
+                executedSql.clear();
+            }
+
+            for (Throwable unsupported : List.of(
+                new SQLFeatureNotSupportedException("Method not supported"),
+                new AbstractMethodError("isValid")
+            )) {
+                isValidFailure[0] = unsupported;
+                assertTrue(validationVerdict(connection).path("valid").asBoolean());
+                assertEquals(List.of("SELECT 1"), executedSql);
+                executedSql.clear();
+            }
+
+            int closesBeforeRejectedProbe = closeCalls[0];
+            probeFailure[0] = new SQLSyntaxErrorException("Incorrect syntax near '1'", "42000");
+            assertTrue(validationVerdict(connection).path("valid").asBoolean());
+            assertEquals(closesBeforeRejectedProbe, closeCalls[0]);
+
+            probeFailure[0] = new SQLException("Connection reset", "08S01");
+            JsonNode lost = validationVerdict(connection);
+            assertFalse(lost.path("valid").asBoolean(true));
+            assertEquals("JDBC connection is not valid", lost.path("reason").asText());
+            assertEquals(closesBeforeRejectedProbe + 1, closeCalls[0]);
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void validateConnectionDoesNotGuessProbeSqlForUnknownDialects() throws Exception {
+        int[] statements = { 0 };
+        ValidationDriver driver = new ValidationDriver(Set.of("jdbc:dbx-unknown:test"), () ->
+            (proxy, method, args) -> switch (method.getName()) {
+                case "isClosed" -> false;
+                case "isValid" -> throw new UnsupportedOperationException("isValid unsupported");
+                case "createStatement" -> {
+                    statements[0]++;
+                    throw new SQLException("unexpected probe");
+                }
+                case "getAutoCommit" -> true;
+                default -> defaultValue(method.getReturnType());
+            });
+        DriverManager.registerDriver(driver);
+        String connection = "{\"connection_string\":\"jdbc:dbx-unknown:test\"}";
+        try {
+            connectForValidation(connection);
+            assertTrue(validationVerdict(connection).path("valid").asBoolean());
+            assertEquals(0, statements[0]);
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    private static void connectForValidation(String connection) throws Exception {
+        JsonNode connected = request("connect", "{\"connection\":" + connection + "}");
+        assertFalse(connected.has("error"), connected.toString());
+    }
+
+    private static JsonNode validationVerdict(String connection) throws Exception {
+        JsonNode response = request("validateConnection", "{\"connection\":" + connection + ",\"timeoutSecs\":3}");
+        assertFalse(response.has("error"), response.toString());
+        return response.path("result");
+    }
+
+    private static final class ValidationDriver implements Driver {
+        private final Set<String> urls;
+        private final Supplier<InvocationHandler> connections;
+        private int opens;
+
+        private ValidationDriver(Set<String> urls, Supplier<InvocationHandler> connections) {
+            this.urls = urls;
+            this.connections = connections;
+        }
+
+        @Override
+        public Connection connect(String url, Properties info) {
+            if (!acceptsURL(url)) {
+                return null;
+            }
+            opens++;
+            return (Connection) Proxy.newProxyInstance(
+                DbxJdbcPluginTest.class.getClassLoader(),
+                new Class<?>[] { Connection.class },
+                connections.get()
+            );
+        }
+
+        @Override
+        public boolean acceptsURL(String url) {
+            return urls.contains(url);
+        }
+
+        @Override
+        public DriverPropertyInfo[] getPropertyInfo(String url, Properties info) {
+            return new DriverPropertyInfo[0];
+        }
+
+        @Override
+        public int getMajorVersion() {
+            return 1;
+        }
+
+        @Override
+        public int getMinorVersion() {
+            return 0;
+        }
+
+        @Override
+        public boolean jdbcCompliant() {
+            return false;
+        }
+
+        @Override
+        public java.util.logging.Logger getParentLogger() {
+            return java.util.logging.Logger.getGlobal();
+        }
     }
 }

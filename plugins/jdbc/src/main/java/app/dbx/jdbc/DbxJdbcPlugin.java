@@ -33,6 +33,10 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.SQLClientInfoException;
 import java.sql.SQLFeatureNotSupportedException;
+import java.sql.SQLNonTransientConnectionException;
+import java.sql.SQLRecoverableException;
+import java.sql.SQLTimeoutException;
+import java.sql.SQLTransientConnectionException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.sql.Statement;
@@ -566,7 +570,7 @@ public final class DbxJdbcPlugin {
         String sessionId = optionalText(result, "session_id");
         for (JsonNode cell : result.path("large_value_cells")) connectionState().largeValues.release(cell.path("value_ref").asText());
         if (sessionId == null) sessionId = optionalText(params, "sessionId");
-        if (sessionId != null) closeQuerySession(sessionId);
+        if (sessionId != null) discardQuerySession(sessionId);
         throw new SQLException(RESPONSE_LIMIT_MESSAGE);
     }
 
@@ -655,6 +659,15 @@ public final class DbxJdbcPlugin {
         try {
             if (shuttingDown || state.closing) throw new SQLException("JDBC logical session is closed");
             if ("openJdbcSession".equals(method)) return okResult();
+            if (isValidateConnection(method)) {
+                CONNECTION_STATE.set(state);
+                try {
+                    return validateConnection(connection, positiveInt(params, "timeoutSecs", 5));
+                } finally {
+                    state.activeStatement = null;
+                    CONNECTION_STATE.remove();
+                }
+            }
             authorizeNativeJobRequest(state, method, params, connection);
             if (state.nativeLegacyJob != null && !NativeLegacyJobSession.isMethod(method)) {
                 throw new SQLException("native_job_session_reserved");
@@ -728,6 +741,10 @@ public final class DbxJdbcPlugin {
                 ObjectNode result = MAPPER.createObjectNode();
                 result.put("ok", true);
                 response.set("result", result);
+                return response;
+            }
+            if (isValidateConnection(method)) {
+                response.set("result", validateConnection(connection, positiveInt(params, "timeoutSecs", 5)));
                 return response;
             }
             // Native Job callers own a Core metadata process; serve() serializes default requests.
@@ -868,6 +885,7 @@ public final class DbxJdbcPlugin {
                 params.path("offset").asLong(-1), params.path("limit").asInt(0)));
             case "release_large_value" -> MAPPER.valueToTree(Map.of("released",
                 connectionState().largeValues.release(requireText(params, "valueRef"))));
+            case "connectionParameters" -> MAPPER.valueToTree(connectionParameters(connection));
             case "testConnection" -> connectionTestResult(openConnection(connection));
             case "connect" -> {
                 openConnection(connection);
@@ -998,6 +1016,134 @@ public final class DbxJdbcPlugin {
             result.set("databaseInfo", databaseInfo);
         }
         return result;
+    }
+
+    private static boolean isValidateConnection(String method) {
+        return "validateConnection".equals(method) || "validate_connection".equals(method);
+    }
+
+    private static ObjectNode validateConnection(JsonNode connection, int timeoutSecs) {
+        JdbcConnectionState state = connectionState();
+        if (state.nativeJobSession != null || state.nativeLegacyJob != null) {
+            return connectionVerdict(null);
+        }
+        String failure = sharedConnectionFailure(state, optionalText(connection, "connection_string"), timeoutSecs);
+        if (failure != null) {
+            closeSharedConnection();
+        }
+        return connectionVerdict(failure);
+    }
+
+    private static ObjectNode connectionVerdict(String failure) {
+        ObjectNode verdict = MAPPER.createObjectNode();
+        verdict.put("valid", failure == null);
+        if (failure != null) {
+            verdict.put("reason", failure);
+        }
+        return verdict;
+    }
+
+    private static String sharedConnectionFailure(JdbcConnectionState state, String url, int timeoutSecs) {
+        Connection active = state.sharedConnection;
+        if (active == null) {
+            return "JDBC connection is not open";
+        }
+        if (reportsClosed(active)) {
+            return "JDBC connection is closed";
+        }
+        if (state.manualTransactionActive || hasActiveQuerySession(active)) {
+            return null;
+        }
+        return answersValidationProbe(active, url, timeoutSecs) ? null : "JDBC connection is not valid";
+    }
+
+    private static boolean reportsClosed(Connection connection) {
+        try {
+            return connection.isClosed();
+        } catch (SQLException | RuntimeException | LinkageError ignored) {
+            return false;
+        }
+    }
+
+    private static boolean answersValidationProbe(Connection connection, String url, int timeoutSecs) {
+        try {
+            return connection.isValid(timeoutSecs);
+        } catch (SQLException | RuntimeException | LinkageError ignored) {
+        }
+        String probeSql = jdbcValidationQuery(url);
+        if (probeSql == null) {
+            return true;
+        }
+        try (Statement statement = connection.createStatement()) {
+            trackActiveStatement(statement);
+            try {
+                statement.setQueryTimeout(timeoutSecs);
+            } catch (SQLException | RuntimeException | LinkageError ignored) {
+            }
+            statement.execute(probeSql);
+            return true;
+        } catch (SQLException error) {
+            return !provesConnectionLost(connection, error);
+        } catch (RuntimeException | LinkageError ignored) {
+            return true;
+        }
+    }
+
+    private static boolean provesConnectionLost(Connection connection, SQLException error) {
+        if (reportsClosed(connection)) {
+            return true;
+        }
+        Throwable cause = error;
+        for (int depth = 0; cause != null && depth < 16; depth++) {
+            if (cause instanceof IOException
+                || cause instanceof SQLNonTransientConnectionException
+                || cause instanceof SQLTransientConnectionException
+                || cause instanceof SQLRecoverableException
+                || cause instanceof SQLTimeoutException) {
+                return true;
+            }
+            if (cause instanceof SQLException sqlError
+                && sqlError.getSQLState() != null
+                && sqlError.getSQLState().startsWith("08")) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
+    }
+
+    private static final List<String> SELECT_ONE_VALIDATION_URL_PREFIXES = List.of(
+        "jdbc:sqlserver:",
+        "jdbc:jtds:sqlserver:",
+        "jdbc:postgresql:",
+        "jdbc:mysql:",
+        "jdbc:mariadb:",
+        "jdbc:starrocks:",
+        "jdbc:doris:",
+        "jdbc:clickhouse:",
+        "jdbc:kingbase",
+        "jdbc:gaussdb:",
+        "jdbc:opengauss:",
+        "jdbc:h2:",
+        "jdbc:sqlite:",
+        "jdbc:duckdb:"
+    );
+
+    private static String jdbcValidationQuery(String url) {
+        if (urlMatchesPrefix(url, "jdbc:oracle:")
+            || urlMatchesPrefix(url, "jdbc:dm:")
+            || urlMatchesPrefix(url, "jdbc:oceanbase:oracle:")) {
+            return "SELECT 1 FROM DUAL";
+        }
+        if (urlMatchesPrefix(url, "jdbc:db2:")) {
+            return "SELECT 1 FROM SYSIBM.SYSDUMMY1";
+        }
+        for (String prefix : SELECT_ONE_VALIDATION_URL_PREFIXES) {
+            if (urlMatchesPrefix(url, prefix)) {
+                return "SELECT 1";
+            }
+        }
+        return null;
     }
 
     private static ObjectNode databaseInfoResult(Connection connection) {
@@ -1139,7 +1285,7 @@ public final class DbxJdbcPlugin {
 
         ClassLoader loader = urls.isEmpty()
             ? Thread.currentThread().getContextClassLoader()
-            : new URLClassLoader(urls.toArray(URL[]::new), DbxJdbcPlugin.class.getClassLoader());
+            : new URLClassLoader(urls.toArray(URL[]::new), ClassLoader.getPlatformClassLoader());
         Thread.currentThread().setContextClassLoader(loader);
         registeredDriverClassLoader = loader;
 
@@ -1880,7 +2026,10 @@ public final class DbxJdbcPlugin {
         boolean preserveOracleDateTime = isOracleUrl(jdbcUrl(connection));
         ZoneId timestampZone = tdengineTimestampZone(connection, conn);
         boolean bitStringColumns = usesBitStringColumns(connection);
-        boolean restoreAutoCommit = beginPagedQueryTransaction(connection, conn);
+        // DDL has no cursor to keep alive across pages, and wrapping it in the
+        // paged transaction changes how PostgreSQL-compatible engines execute
+        // it (see pagedQueryCannotReturnRows).
+        boolean restoreAutoCommit = !pagedQueryCannotReturnRows(sql) && beginPagedQueryTransaction(connection, conn);
         Statement statement;
         try {
             statement = createPagedQueryStatement(conn);
@@ -1906,7 +2055,10 @@ public final class DbxJdbcPlugin {
                 result.putNull("session_id");
                 result.put("has_more", false);
                 statement.close();
-                restorePagedQueryTransaction(conn, restoreAutoCommit);
+                // No cursor survives this statement, so end the transaction by
+                // committing: rollback here silently undid DDL/DML such as
+                // DROP TABLE or CREATE TABLE AS while reporting success (#13644).
+                commitPagedQueryTransaction(conn, restoreAutoCommit);
                 return result;
             }
 
@@ -1959,6 +2111,34 @@ public final class DbxJdbcPlugin {
         }
     }
 
+    /**
+     * Keywords for statements that never leave a result-set cursor behind.
+     * The paged transaction exists only to keep a cursor readable across pages;
+     * for these statements it changes engine semantics instead of adding value
+     * (issue #14243: PostgreSQL-compatible engines may commit a `CREATE TABLE AS`
+     * on their own while the selected rows stay inside the transaction, so the
+     * client sees 42P07 on a retry and an empty table is left behind). Running
+     * them in auto-commit matches psql and DBeaver.
+     */
+    private static final Set<String> NO_RESULT_SET_KEYWORDS = Set.of(
+        "ALTER",
+        "ANALYZE",
+        "CLUSTER",
+        "COMMENT",
+        "CREATE",
+        "DROP",
+        "GRANT",
+        "REINDEX",
+        "REFRESH",
+        "REVOKE",
+        "TRUNCATE",
+        "VACUUM"
+    );
+
+    private static boolean pagedQueryCannotReturnRows(String sql) {
+        return NO_RESULT_SET_KEYWORDS.contains(firstSqlKeyword(sql));
+    }
+
     private static boolean beginPagedQueryTransaction(JsonNode connectionConfig, Connection connection)
         throws SQLException {
         if (!isPostgresConnection(connectionConfig) || !connection.getAutoCommit()) {
@@ -1979,6 +2159,38 @@ public final class DbxJdbcPlugin {
         try {
             connection.setAutoCommit(true);
         } catch (SQLException ignored) {
+        }
+    }
+
+    /**
+     * Ends the transaction begun by {@link #beginPagedQueryTransaction} after a
+     * statement completed without leaving a cursor behind, or after a paged
+     * cursor was fully drained. The statement's effects are the user's intent,
+     * so the transaction is committed, not rolled back: a rolled-back DROP
+     * TABLE or CREATE TABLE AS silently vanished while DBX reported success
+     * (#13644). Only the caller that flipped auto-commit off owns the
+     * transaction; manual transactions end through their own commit/rollback
+     * entry points.
+     *
+     * <p>A failed commit is rethrown after a best-effort connection restore:
+     * a deferred constraint failure or a connection dropped during commit must
+     * reach the caller as an error, not as a success whose effects vanish.
+     * Secondary failures while clearing the broken transaction are ignored so
+     * the original commit error is what surfaces.
+     */
+    private static void commitPagedQueryTransaction(Connection connection, boolean ownedTransaction) throws SQLException {
+        if (!ownedTransaction) {
+            return;
+        }
+        try {
+            connection.commit();
+        } catch (SQLException | RuntimeException | Error error) {
+            restorePagedQueryTransaction(connection, true);
+            throw error;
+        }
+        try {
+            connection.setAutoCommit(true);
+        } catch (SQLException | AbstractMethodError | UnsupportedOperationException ignored) {
         }
     }
 
@@ -2032,7 +2244,7 @@ public final class DbxJdbcPlugin {
         return queryPageResult(session, rows, largeCells, false, true);
         } catch (SQLException | RuntimeException | LinkageError error) {
             for (JsonNode cell : largeCells) connectionState().largeValues.release(cell.path("value_ref").asText());
-            closeQuerySession(session.id);
+            discardQuerySession(session.id);
             throw error;
         }
     }
@@ -2054,13 +2266,22 @@ public final class DbxJdbcPlugin {
         return result;
     }
 
-    private static ObjectNode closeQuerySessionResult(String sessionId) {
+    private static ObjectNode closeQuerySessionResult(String sessionId) throws SQLException {
         ObjectNode result = MAPPER.createObjectNode();
         result.put("ok", closeQuerySession(sessionId));
         return result;
     }
 
-    private static boolean closeQuerySession(String sessionId) {
+    /**
+     * Success-path close: the cursor completed or the caller explicitly closed
+     * it, so the paging transaction ends by committing. JDBC reports -1 as the
+     * update count whenever the current result is a result set -- including
+     * INSERT ... RETURNING -- so effects cannot be classified from the driver;
+     * committing every completed statement is what keeps returned rows durable
+     * (#13644). A commit failure propagates ({@link #commitPagedQueryTransaction})
+     * instead of reporting the session as closed-ok.
+     */
+    private static boolean closeQuerySession(String sessionId) throws SQLException {
         QuerySession session = connectionState().querySessions.remove(sessionId);
         if (session == null) {
             return false;
@@ -2074,14 +2295,39 @@ public final class DbxJdbcPlugin {
             session.statement.close();
         } catch (Exception ignored) {
         }
-        restorePagedQueryTransaction(session.connection, session.restoreAutoCommit);
+        commitPagedQueryTransaction(session.connection, session.restoreAutoCommit);
         return true;
+    }
+
+    /**
+     * Error-path cleanup: a page failed or was cancelled, so an owned paging
+     * transaction ends with a rollback and never commits, and the cleanup does
+     * not mask the original error with a commit failure.
+     */
+    private static void discardQuerySession(String sessionId) {
+        QuerySession session = connectionState().querySessions.remove(sessionId);
+        if (session == null) {
+            return;
+        }
+        if (session.pendingRow != null) releaseRowValues(session.pendingRow);
+        try {
+            session.resultSet.close();
+        } catch (Exception ignored) {
+        }
+        try {
+            session.statement.close();
+        } catch (Exception ignored) {
+        }
+        restorePagedQueryTransaction(session.connection, session.restoreAutoCommit);
     }
 
     private static void closeAllQuerySessions() {
         List<String> sessionIds = new ArrayList<>(connectionState().querySessions.keySet());
         for (String sessionId : sessionIds) {
-            closeQuerySession(sessionId);
+            try {
+                closeQuerySession(sessionId);
+            } catch (SQLException ignored) {
+            }
         }
     }
 
@@ -4932,6 +5178,18 @@ public final class DbxJdbcPlugin {
             return url;
         }
         return appendJdbcUrlParam(url, "key", password);
+    }
+
+    static List<Map<String, Object>> connectionParameters(JsonNode connection) throws SQLException {
+        String url = jdbcUrl(connection);
+        if (url == null || url.isBlank()) return List.of();
+        Properties properties = new Properties();
+        String username = optionalText(connection, "username");
+        String password = optionalText(connection, "password");
+        if (username != null) properties.setProperty("user", username);
+        if (password != null) properties.setProperty("password", password);
+        Driver driver = registeredDriver == null ? DriverManager.getDriver(url) : registeredDriver;
+        return JdbcConnectionParameters.describe(driver, url, properties);
     }
 
     static String jdbcUrl(JsonNode connection) {

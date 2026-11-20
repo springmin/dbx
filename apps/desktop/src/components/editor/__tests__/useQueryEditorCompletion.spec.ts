@@ -436,6 +436,43 @@ describe("SQL completion trailing space insertion", () => {
   });
 });
 
+describe("SQL completion replacement ranges", () => {
+  beforeEach(() => vi.useRealTimers());
+
+  it("replaces a keyword prefix on a later Doris partition line without changing earlier SQL", async () => {
+    const doc = [
+      "CREATE TABLE single_doris (",
+      "  order_date DATE NOT NULL,",
+      "  order_id BIGINT,",
+      "  region_id INT NOT NULL,",
+      "  status VARCHAR(20) NOT NULL,",
+      "  amount DECIMAL(18,2)",
+      ")DUPLICATE KEY (order_date,order_id)",
+      "PARTITION by range(order_date)",
+      "(",
+      '  PARTITION p20261101 values [("2026-11-01"),("2026-11-02"))',
+      '  PARTITION p20261102 value [("2026-11-02"),("2026-11-02"))',
+      ")distributed by hash(order_id) buckets 4",
+      "PROPERTIES",
+      "(",
+      '  "replication_num"="1"',
+      ");",
+    ].join("\n");
+    const expected = doc.replace("p20261102 value ", "p20261102 VALUES ");
+    const { provide, currentView } = createHarness({ databaseType: "doris", dialect: "doris", modelValue: doc }, undefined, true);
+    const cursor = doc.indexOf("p20261102 value ") + "p20261102 value".length;
+    currentView.dispatch({ selection: { anchor: cursor } });
+
+    const result = await provide(false);
+    const option = result?.options.find((candidate) => candidate.label === "VALUES");
+    expect(option).toBeDefined();
+    expect(result!.from).toBe(cursor - "value".length);
+    (option!.apply as (view: EditorView, completion: unknown, from: number, to: number) => void)(currentView, option, result!.from, cursor);
+
+    expect(currentView.state.doc.toString()).toBe(expected);
+  });
+});
+
 describe("QueryEditor completion provider ownership", () => {
   it.each(["cursor", "document", "view", "composition", "mode"])("rejects asynchronous analysis after a %s change", async (change) => {
     let resolve!: (result: SqlCompletionAnalysisResult) => void;
@@ -793,5 +830,70 @@ describe.each([false, true])("bare alias-dot column resolution (semantic=%s)", (
     store.listCompletionColumns.mockResolvedValue([{ name: "id", table: "users", schema: "myschema" }]);
     const result = await provide(false);
     expect(result?.options.some((option) => option.label === "id")).toBe(true);
+  });
+});
+
+describe("Oracle SQL column completion case-insensitivity and live refresh (#15212)", () => {
+  beforeEach(() => vi.useRealTimers());
+
+  it("passes unquoted table/schema quote flags to local column lookup and matches Oracle cache case-insensitively", async () => {
+    const { provide, store, metadata } = createHarness(
+      {
+        databaseType: "oracle",
+        dialect: "oracle",
+        database: "ORCL",
+        schema: "HR",
+        modelValue: "SELECT * FROM hr.employees WHERE c",
+      },
+      undefined,
+      true,
+    );
+    store.lookupLocalCompletionColumns.mockReturnValue([{ name: "CREATE_TIME", table: "EMPLOYEES", schema: "HR", dataType: "DATE" }]);
+
+    const first = await provide(false);
+    expect(store.lookupLocalCompletionColumns).toHaveBeenCalledWith("connection", "ORCL", "employees", "hr", undefined, expect.objectContaining({ tableQuoted: false, schemaQuoted: false }));
+    expect(first?.options.map((option) => option.label)).toContain("CREATE_TIME");
+
+    // Reusing cached metadata under uppercase HR.EMPLOYEES succeeds case-insensitively.
+    metadata.cachedColumnsByTable.clear();
+    metadata.cachedColumnsByTable.set("HR.EMPLOYEES", [{ name: "CUSTOMER_ID", table: "EMPLOYEES", schema: "HR", dataType: "NUMBER" }]);
+    const second = await provide(false);
+    expect(second?.options.map((option) => option.label)).toContain("CUSTOMER_ID");
+  });
+
+  it("refreshes an open snippet completion menu once background columns finish loading (#15212)", async () => {
+    const sql = "SELECT * FROM hr.employees WHERE id = c";
+    const { provide, store, runtime, settings, startCompletion, currentView } = createHarness(
+      {
+        databaseType: "oracle",
+        dialect: "oracle",
+        database: "ORCL",
+        schema: "HR",
+        modelValue: sql,
+      },
+      undefined,
+      true,
+    );
+    settings.editorSettings.snippets = [{ id: "case-when", label: "case when", prefix: "case", body: "CASE WHEN ${1:cond} THEN ${2:val} END" }];
+    runtime.codeMirrorCompletionStatus = () => "active";
+    let resolveRefresh!: (columns: SqlCompletionColumn[]) => void;
+    store.refreshCompletionColumns.mockImplementationOnce(
+      () =>
+        new Promise((done) => {
+          resolveRefresh = done;
+        }),
+    );
+
+    // Local result returns snippets immediately without blocking typing.
+    const initial = await provide(false);
+    expect(initial?.options.some((option) => option.type === "snippet")).toBe(true);
+    expect(store.refreshCompletionColumns).toHaveBeenCalledWith("connection", "ORCL", "employees", "hr", expect.objectContaining({ tableQuoted: false, schemaQuoted: false }), undefined);
+
+    // Once background column load resolves, active completion refreshes and now serves columns.
+    resolveRefresh([{ name: "CREATED_BY", table: "EMPLOYEES", schema: "HR", dataType: "VARCHAR2" }]);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(startCompletion).toHaveBeenCalledWith(currentView);
+    const refreshed = await provide(false);
+    expect(refreshed?.options.map((option) => option.label)).toContain("CREATED_BY");
   });
 });
