@@ -546,6 +546,6 @@ pnpm build
 - 依赖版本未变:`aws-lc-sys 0.43.0`、`zstd-sys 2.0.16`,`patches/ohos/` 继续适用。
 - 前端依赖升级:`rolldown 1.2.16`、`@tailwindcss/oxide 4.3.4`;lightningcss shim 保留。
 - 构建 SDK:`ohos-sdk-native/26.0.0.38`;二进制 115,230,464 字节。
-- 发布包:`dbx-web-0.6.72-ohos-aarch64.tar.gz`(59,945,225 字节),
+- 发布包:`dbx-web-0.6.72-ohos-aarch64.tar.gz`(59,935,706 字节),
   SHA256 `b9950af39cb0f2e705b7e6647af9900c69699f914d034f2eb40488a5bef66a38`。
 - 服务验证:`Registered 37 core dialects`、`Dialect plugins loaded: 37 success, 0 errors`、SQLite 查询正常。
