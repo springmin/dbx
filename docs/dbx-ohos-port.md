@@ -549,3 +549,12 @@ pnpm build
 - 发布包:`dbx-web-0.6.72-ohos-aarch64.tar.gz`(59,935,706 字节),
   SHA256 `b9950af39cb0f2e705b7e6647af9900c69699f914d034f2eb40488a5bef66a38`。
 - 服务验证:`Registered 37 core dialects`、`Dialect plugins loaded: 37 success, 0 errors`、SQLite 查询正常。
+
+## 12. v0.6.73 更新(2026-11-24)
+
+- 合并上游 v0.6.73(v0.6.72 之后 169 个提交,439 个文件),无冲突。
+- 依赖版本未变(`aws-lc-sys 0.43.0`、`zstd-sys 2.0.16`、`@tailwindcss/oxide 4.3.4`、`rolldown 1.2.16`),
+  `patches/ohos/` 与 lightningcss shim 继续适用。
+- 二进制 116,483,840 字节;发布包 `dbx-web-0.6.73-ohos-aarch64.tar.gz`(60,678,746 字节),
+  SHA256 `065f9df098c920499ae22338fac5b3d9e61f7adb0cdb861b348d13ff691c1f19`。
+- 验证:`Registered 37 core dialects`、`Dialect plugins loaded: 37 success, 0 errors`、SQLite 查询正常。
